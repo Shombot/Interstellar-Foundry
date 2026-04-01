@@ -804,29 +804,38 @@
 
       <!-- TELEMETRY + SIGNAL -->
       <div class="panel">
-        <div class="panel-title">Signal Strength & Sensor Health</div>
-        <div class="panel-subtitle">Real-time sensor metrics from Node A</div>
-        <div style="margin-bottom: 20px;">
+        <div class="panel-title">FM24-NP100 Radar</div>
+        <div class="panel-subtitle">24GHz mmWave · UART /dev/ttyTHS1 · 57600 baud</div>
+
+        <!-- Live radar stat rows -->
+        <div style="margin-bottom: 14px;">
           <div class="signal-row">
-            <span class="signal-label">Radar SNR</span>
-            <div class="signal-bar-bg"><div class="signal-bar-fill" style="width:78%; background: var(--accent);"></div></div>
-            <span class="signal-value">78%</span>
+            <span class="signal-label">Distance</span>
+            <div class="signal-bar-bg"><div id="bar-dist" class="signal-bar-fill" style="width:40%; background: var(--accent);"></div></div>
+            <span class="signal-value" id="val-dist">8.0m</span>
           </div>
           <div class="signal-row">
-            <span class="signal-label">Cam Conf.</span>
-            <div class="signal-bar-bg"><div class="signal-bar-fill" style="width:91%; background: var(--accent3);"></div></div>
-            <span class="signal-value">91%</span>
+            <span class="signal-label">Peak Amp</span>
+            <div class="signal-bar-bg"><div id="bar-amp" class="signal-bar-fill" style="width:60%; background: var(--accent3);"></div></div>
+            <span class="signal-value" id="val-amp">26</span>
           </div>
           <div class="signal-row">
-            <span class="signal-label">Telemetry</span>
-            <div class="signal-bar-bg"><div class="signal-bar-fill" style="width:65%; background: var(--warning);"></div></div>
-            <span class="signal-value">65%</span>
+            <span class="signal-label">Mode</span>
+            <div class="signal-bar-bg" style="background:transparent; display:flex; align-items:center; padding-left:4px;">
+              <span id="val-mode" style="font-family:'Space Mono',monospace; font-size:11px; color:var(--accent3);">B (dist+spectrum)</span>
+            </div>
+            <span class="signal-value" id="val-frames">0f</span>
           </div>
-          <div class="signal-row">
-            <span class="signal-label">WiFi Link</span>
-            <div class="signal-bar-bg"><div class="signal-bar-fill" style="width:85%; background: var(--accent);"></div></div>
-            <span class="signal-value">85%</span>
-          </div>
+        </div>
+
+        <!-- FMCW Spectrum canvas (126 bins from FM24-NP100 Mode B) -->
+        <div class="panel-subtitle" style="margin-bottom:6px;">FMCW Spectrum (126 bins)</div>
+        <canvas id="spectrum-canvas" width="400" height="70"
+          style="width:100%; height:70px; border-radius:6px; background:#0a1220; display:block; margin-bottom:14px;"></canvas>
+        <div style="display:flex; justify-content:space-between; margin-bottom:14px;">
+          <span style="font-family:'Space Mono',monospace; font-size:9px; color:var(--muted);">bin 0</span>
+          <span style="font-family:'Space Mono',monospace; font-size:9px; color:var(--muted);" id="val-peak-bin">peak: bin --</span>
+          <span style="font-family:'Space Mono',monospace; font-size:9px; color:var(--muted);">bin 125</span>
         </div>
 
         <div class="panel-title" style="margin-bottom: 4px;">Jetson Nano Telemetry</div>
@@ -969,50 +978,136 @@
     ws.onerror = (e) => console.error('[WS] Error', e);
   }
 
+  // ── Spectrum canvas renderer (FM24-NP100 Mode B, 126 bins) ─────────────
+  const specCanvas = document.getElementById('spectrum-canvas');
+  const specCtx    = specCanvas ? specCanvas.getContext('2d') : null;
+  const MAX_AMP    = 44;   // MAX_SPECTRAL_VAL from radar_display.py
+  const BINS       = 126;  // SPECTRAL_BINS from radar_display.py
+
+  function drawSpectrum(spectrum) {
+    if (!specCtx || !spectrum || spectrum.length < BINS) return;
+    const W = specCanvas.width, H = specCanvas.height;
+    specCtx.clearRect(0, 0, W, H);
+
+    const binW = W / BINS;
+    for (let i = 0; i < BINS; i++) {
+      const val   = Math.min(spectrum[i], MAX_AMP);
+      const ratio = val / MAX_AMP;
+      const bh    = Math.max(1, ratio * H);
+      // Colour: cyan → green → yellow → red with intensity
+      const r = Math.round(255 * Math.min(ratio * 2, 1));
+      const g = Math.round(255 * (1 - Math.max(ratio - 0.5, 0) * 2));
+      const b = Math.round(255 * (1 - ratio));
+      specCtx.fillStyle = `rgb(${r},${g},${b})`;
+      specCtx.fillRect(Math.floor(i * binW), H - bh, Math.ceil(binW) - 1, bh);
+    }
+
+    // Peak marker line
+    const peak = spectrum.indexOf(Math.max(...spectrum));
+    if (spectrum[peak] > 1) {
+      specCtx.strokeStyle = '#ffffff66';
+      specCtx.lineWidth = 1;
+      specCtx.beginPath();
+      specCtx.moveTo(peak * binW + binW / 2, 0);
+      specCtx.lineTo(peak * binW + binW / 2, H);
+      specCtx.stroke();
+    }
+  }
+
+  // ── Main live-state updater ──────────────────────────────────────────────
   function applyLiveState(data) {
-    // Update stat cards
+    // Stat cards
     if (data.total_detections !== undefined)
       document.querySelectorAll('.stat-value')[0].textContent = data.total_detections;
     if (data.active_threats !== undefined)
       document.querySelectorAll('.stat-value')[1].textContent = data.active_threats;
 
-    // Update telemetry table
+    // ── FM24-NP100 radar panel ───────────────────────────────────────────
+    const rt = data.radar_telem || {};
+    if (rt.distance_m !== undefined) {
+      const distPct = Math.min((rt.distance_m / 20.0) * 100, 100).toFixed(0);
+      const distColor = rt.distance_m < 5 ? 'var(--accent2)'
+                      : rt.distance_m < 15 ? 'var(--warning)'
+                      : 'var(--accent)';
+      const barDist = document.getElementById('bar-dist');
+      const valDist = document.getElementById('val-dist');
+      if (barDist) { barDist.style.width = distPct + '%'; barDist.style.background = distColor; }
+      if (valDist)   valDist.textContent = rt.distance_m.toFixed(2) + 'm';
+    }
+    if (rt.peak_amp !== undefined) {
+      const ampPct = Math.min((rt.peak_amp / MAX_AMP) * 100, 100).toFixed(0);
+      const barAmp = document.getElementById('bar-amp');
+      const valAmp = document.getElementById('val-amp');
+      if (barAmp) barAmp.style.width = ampPct + '%';
+      if (valAmp) valAmp.textContent = rt.peak_amp.toFixed(0);
+    }
+    if (rt.mode !== undefined) {
+      const valMode = document.getElementById('val-mode');
+      if (valMode) valMode.textContent =
+        rt.mode === 'B' ? 'B (dist+spectrum)' : rt.mode === 'A' ? 'A (dist only)' : 'detecting…';
+    }
+    if (rt.frames !== undefined) {
+      const valFrames = document.getElementById('val-frames');
+      if (valFrames) valFrames.textContent = rt.frames + 'f';
+    }
+    if (rt.peak_bin !== undefined && rt.peak_bin >= 0) {
+      const el = document.getElementById('val-peak-bin');
+      if (el) el.textContent = `peak: bin ${rt.peak_bin}  amp ${(rt.peak_amp||0).toFixed(0)}`;
+    }
+    // Draw spectrum
+    if (rt.spectrum && rt.spectrum.length === BINS) drawSpectrum(rt.spectrum);
+
+    // ── Jetson hardware telemetry table ──────────────────────────────────
     const telem = data.telemetry || {};
-    const rows = document.querySelectorAll('.telem-table td:last-child');
+    const rows  = document.querySelectorAll('.telem-table td:last-child');
     if (rows.length >= 6) {
-      if (telem.cpu_percent  !== undefined) rows[0].textContent = telem.cpu_percent + '%';
-      if (telem.ram_used_gb  !== undefined) rows[2].textContent =
+      if (telem.cpu_percent     !== undefined) rows[0].textContent = telem.cpu_percent + '%';
+      if (telem.ram_used_gb     !== undefined) rows[2].textContent =
         telem.ram_used_gb + ' / ' + (telem.ram_total_gb || '?') + ' GB';
-      if (telem.cpu_temp_c   !== undefined) rows[3].textContent = telem.cpu_temp_c + '°C';
+      if (telem.cpu_temp_c      !== undefined) rows[3].textContent = telem.cpu_temp_c + '°C';
       if (telem.battery_percent !== undefined) rows[4].textContent = telem.battery_percent + '%';
-      if (telem.uptime_sec   !== undefined) {
+      if (telem.uptime_sec      !== undefined) {
         const u = telem.uptime_sec;
-        rows[5].textContent = `${String(Math.floor(u/3600)).padStart(2,'0')}:${String(Math.floor((u%3600)/60)).padStart(2,'0')}:${String(u%60).padStart(2,'0')}`;
+        rows[5].textContent =
+          `${String(Math.floor(u/3600)).padStart(2,'0')}:${String(Math.floor((u%3600)/60)).padStart(2,'0')}:${String(u%60).padStart(2,'0')}`;
       }
     }
 
-    // Update event list
+    // ── Avg latency (from radar frame count delta proxy) ─────────────────
+    if (rt.stale === false) {
+      document.querySelectorAll('.stat-value')[3].textContent = '< 100';
+    }
+
+    // ── Event list ───────────────────────────────────────────────────────
     const events = data.recent_events || [];
     if (events.length > 0) {
       const list = document.querySelector('.event-list');
       list.innerHTML = events.slice(0, 6).map(e => {
         const level = e.alert_level || 'INFO';
-        const cls = level === 'THREAT' ? 'threat' : level === 'WARNING' ? 'warning' : 'clear';
-        const icon = level === 'THREAT' ? '🔴' : level === 'WARNING' ? '🟡' : '🟢';
-        const ts = new Date(e.timestamp * 1000);
-        const timeStr = `${String(ts.getUTCHours()).padStart(2,'0')}:${String(ts.getUTCMinutes()).padStart(2,'0')}:${String(ts.getUTCSeconds()).padStart(2,'0')}`;
+        const cls   = level === 'THREAT' ? 'threat' : level === 'WARNING' ? 'warning' : 'clear';
+        const icon  = level === 'THREAT' ? '🔴'     : level === 'WARNING' ? '🟡'      : '🟢';
+        const ts    = new Date(e.timestamp * 1000);
+        const time  = `${String(ts.getUTCHours()).padStart(2,'0')}:${String(ts.getUTCMinutes()).padStart(2,'0')}:${String(ts.getUTCSeconds()).padStart(2,'0')}`;
         return `
           <div class="event-item ${cls}">
             <span class="event-icon">${icon}</span>
             <div class="event-info">
               <div class="event-title">${e.uav_class || 'Unknown UAV'}</div>
-              <div class="event-meta">Grp ${e.group || '?'} · ${e.range_m || '?'}m · bearing ${e.bearing_deg || '?'}°</div>
+              <div class="event-meta">Grp ${e.group||'?'} · ${e.range_m||'?'}m · bearing ${e.bearing_deg||'?'}°</div>
             </div>
-            <div class="event-time">${timeStr}</div>
+            <div class="event-time">${time}</div>
           </div>`;
       }).join('');
     }
   }
+
+  // Seed spectrum canvas with demo data so it doesn't look blank offline
+  (function seedSpectrum() {
+    const demo = Array.from({length: 126}, (_, i) =>
+      Math.max(0, 37 * Math.exp(-0.5 * ((i - 38) / 8) ** 2) +
+                  18 * Math.exp(-0.5 * ((i - 75) / 5) ** 2)));
+    drawSpectrum(demo);
+  })();
 
   // Auto-connect if ?jetson=<ip> is in the URL
   if (JETSON_WS) {

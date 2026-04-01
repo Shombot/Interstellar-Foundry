@@ -3,138 +3,108 @@
 radar_node.py
 Interstellar Foundry — Team 7
 
-Reads mmWave radar data from the DFRobot sensor over UART
-and publishes point cloud and telemetry to ROS2 topics.
+ROS2 Humble node wrapping the FM24-NP100 24GHz mmWave radar.
+Delegates all serial parsing to RadarReader from radar_display.py
+(which lives in ~/ on the Jetson, matching its own import convention).
 
-Hardware: DFRobot mmWave Radar → Jetson Orin Nano (UART)
-Platform: ROS2 Humble · Ubuntu 22.04
+Hardware : FM24-NP100 → Jetson Orin Nano  /dev/ttyTHS1  57600 baud
+Platform : ROS2 Humble · Ubuntu 22.04
 """
+
+import sys, os, time, json, struct, math
+import numpy as np
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import String, Header
-import serial
-import struct
-import json
-import time
-import threading
+
+# radar_display.py expects to live in ~/  on the Jetson (its own convention).
+# We add the package directory as a fallback so the import works both ways.
+sys.path.insert(0, os.path.expanduser("~"))
+sys.path.insert(1, os.path.dirname(os.path.abspath(__file__)))
+from radar_display import RadarReader, SPECTRAL_BINS, MAX_SPECTRAL_VAL, DETECTION_RANGE_M
 
 
 class RadarNode(Node):
     """
-    Reads DFRobot mmWave radar frames over UART.
     Publishes:
-        /radar/raw       (sensor_msgs/PointCloud2)
-        /radar/telemetry (std_msgs/String JSON)
+        /radar/raw        sensor_msgs/PointCloud2   – target point at measured range
+        /radar/telemetry  std_msgs/String (JSON)    – distance, spectrum, health
     """
 
     def __init__(self):
         super().__init__('radar_node')
 
-        # --- Parameters ---
-        self.declare_parameter('serial_port', '/dev/ttyTHS1')
-        self.declare_parameter('baud_rate', 115200)
-        self.declare_parameter('frame_id', 'radar_frame')
+        self.declare_parameter('serial_port',     '/dev/ttyTHS1')
+        self.declare_parameter('baud_rate',       57600)   # FM24-NP100 default
+        self.declare_parameter('frame_id',        'radar_frame')
         self.declare_parameter('publish_rate_hz', 10.0)
-        self.declare_parameter('sim_mode', False)  # Set True on Mac for dev
+        self.declare_parameter('sim_mode',        False)
 
-        self.port = self.get_parameter('serial_port').value
-        self.baud = self.get_parameter('baud_rate').value
+        self.port     = self.get_parameter('serial_port').value
+        self.baud     = self.get_parameter('baud_rate').value
         self.frame_id = self.get_parameter('frame_id').value
-        self.rate_hz = self.get_parameter('publish_rate_hz').value
+        self.rate_hz  = self.get_parameter('publish_rate_hz').value
         self.sim_mode = self.get_parameter('sim_mode').value
 
-        # --- Publishers ---
-        self.pub_cloud = self.create_publisher(PointCloud2, '/radar/raw', 10)
-        self.pub_telem = self.create_publisher(String, '/radar/telemetry', 10)
+        self.pub_cloud = self.create_publisher(PointCloud2, '/radar/raw',       10)
+        self.pub_telem = self.create_publisher(String,      '/radar/telemetry', 10)
 
-        # --- Serial connection (skip in sim mode) ---
-        self.ser = None
+        self.reader = None
         if not self.sim_mode:
-            self._connect_serial()
+            self._init_reader()
         else:
-            self.get_logger().warn('Radar running in SIMULATION MODE — no hardware required.')
+            self.get_logger().warn('RadarNode: SIMULATION MODE – synthetic FM24-NP100 data.')
 
-        # --- Timer ---
-        self.timer = self.create_timer(1.0 / self.rate_hz, self.timer_callback)
-        self.detection_count = 0
-
+        self.create_timer(1.0 / self.rate_hz, self._cb)
         self.get_logger().info(
-            f'RadarNode started | port={self.port} | rate={self.rate_hz}Hz | sim={self.sim_mode}'
-        )
+            f'RadarNode ready | {self.port} @ {self.baud} | sim={self.sim_mode}')
 
-    def _connect_serial(self):
+    def _init_reader(self):
         try:
-            self.ser = serial.Serial(self.port, self.baud, timeout=1.0)
-            self.get_logger().info(f'UART connected on {self.port} @ {self.baud} baud')
-        except serial.SerialException as e:
-            self.get_logger().error(f'Failed to open serial port {self.port}: {e}')
-            self.get_logger().warn('Falling back to simulation mode.')
+            self.reader = RadarReader(self.port, self.baud)
+            self.reader.connect()
+            self.reader.start()
+            self.get_logger().info(f'FM24-NP100 connected on {self.port} @ {self.baud} baud')
+        except Exception as e:
+            self.get_logger().error(f'Radar init failed: {e} – falling back to sim mode.')
+            self.reader = None
             self.sim_mode = True
 
-    def timer_callback(self):
-        if self.sim_mode:
-            points = self._generate_sim_points()
-        else:
-            points = self._read_radar_frame()
+    def _cb(self):
+        data = self._sim_data() if (self.sim_mode or self.reader is None) else self.reader.get_data()
+        if data['mode'] is None:
+            return
 
-        if points:
-            cloud_msg = self._points_to_cloud(points)
-            self.pub_cloud.publish(cloud_msg)
+        self.pub_cloud.publish(self._to_cloud(data))
 
-            telem = {
-                'timestamp': time.time(),
-                'point_count': len(points),
-                'sim_mode': self.sim_mode,
-            }
-            telem_msg = String()
-            telem_msg.data = json.dumps(telem)
-            self.pub_telem.publish(telem_msg)
+        spec = data['spectrum']
+        msg = String()
+        msg.data = json.dumps({
+            'timestamp':   data['last_frame'] or time.time(),
+            'mode':        data['mode'],
+            'distance_cm': data['distance_cm'],
+            'distance_m':  round(data['distance_m'], 3),
+            'spectrum':    spec.tolist(),
+            'peak_bin':    int(np.argmax(spec)) if np.any(spec > 0) else -1,
+            'peak_amp':    float(np.max(spec)),
+            'frames':      data['frames'],
+            'sim_mode':    self.sim_mode,
+            'stale':       (time.time() - data['last_frame']) > 2.0
+                           if data['last_frame'] else True,
+        })
+        self.pub_telem.publish(msg)
 
-            self.detection_count += 1
+    def _to_cloud(self, data):
+        """Single-point cloud at the measured range along +X."""
+        dist_m   = float(data['distance_m'])
+        spec     = data['spectrum']
+        intensity = float(np.max(spec) / MAX_SPECTRAL_VAL) if np.any(spec > 0) else 0.0
 
-    def _read_radar_frame(self):
-        """
-        Read and parse one frame from the DFRobot mmWave radar.
-        The radar outputs frames as ASCII lines: 'x,y,z,snr'
-        Returns list of (x, y, z, intensity) tuples in meters.
-        """
-        points = []
-        if self.ser is None or not self.ser.is_open:
-            return points
-        try:
-            line = self.ser.readline().decode('utf-8', errors='ignore').strip()
-            for entry in line.split(';'):
-                parts = entry.split(',')
-                if len(parts) >= 4:
-                    x, y, z, snr = map(float, parts[:4])
-                    points.append((x, y, z, snr))
-        except Exception as e:
-            self.get_logger().warn(f'Radar parse error: {e}')
-        return points
-
-    def _generate_sim_points(self):
-        """Return synthetic radar points for development/testing on Mac."""
-        import math, random
-        t = time.time()
-        points = []
-        # Simulate 2 moving UAVs
-        for i, (base_angle, base_r) in enumerate([(0.8, 8.0), (2.4, 12.0)]):
-            angle = base_angle + math.sin(t * 0.3 + i) * 0.3
-            r = base_r + math.sin(t * 0.5 + i) * 1.5
-            x = r * math.cos(angle) + random.gauss(0, 0.1)
-            y = r * math.sin(angle) + random.gauss(0, 0.1)
-            z = 3.0 + math.sin(t * 0.2 + i) * 0.5
-            snr = 0.75 + random.gauss(0, 0.05)
-            points.append((x, y, z, snr))
-        return points
-
-    def _points_to_cloud(self, points):
-        """Pack (x, y, z, intensity) list into a sensor_msgs/PointCloud2."""
-        header = Header()
-        header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = self.frame_id
+        hdr = Header()
+        hdr.stamp    = self.get_clock().now().to_msg()
+        hdr.frame_id = self.frame_id
 
         fields = [
             PointField(name='x',         offset=0,  datatype=PointField.FLOAT32, count=1),
@@ -142,24 +112,38 @@ class RadarNode(Node):
             PointField(name='z',         offset=8,  datatype=PointField.FLOAT32, count=1),
             PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
         ]
-        point_step = 16
-        data = b''.join(struct.pack('ffff', *p) for p in points)
-
-        msg = PointCloud2()
-        msg.header = header
-        msg.height = 1
-        msg.width = len(points)
-        msg.fields = fields
+        msg              = PointCloud2()
+        msg.header       = hdr
+        msg.height       = 1
+        msg.width        = 1
+        msg.fields       = fields
         msg.is_bigendian = False
-        msg.point_step = point_step
-        msg.row_step = point_step * len(points)
-        msg.data = data
-        msg.is_dense = True
+        msg.point_step   = 16
+        msg.row_step     = 16
+        msg.data         = struct.pack('ffff', dist_m, 0.0, 0.0, intensity)
+        msg.is_dense     = True
         return msg
 
+    def _sim_data(self):
+        t        = time.time()
+        dist_m   = 8.0 + 4.0 * math.sin(t * 0.4)
+        peak_bin = int((dist_m / DETECTION_RANGE_M) * SPECTRAL_BINS)
+        x        = np.arange(SPECTRAL_BINS, dtype=np.float32)
+        spectrum = (MAX_SPECTRAL_VAL * 0.85 *
+                    np.exp(-0.5 * ((x - peak_bin) / 6.0) ** 2)).astype(np.float32)
+        return {
+            'mode':        'B',
+            'distance_cm': int(dist_m * 100),
+            'distance_m':  dist_m,
+            'spectrum':    spectrum,
+            'history':     [],
+            'frames':      int(t * self.rate_hz),
+            'last_frame':  t,
+        }
+
     def destroy_node(self):
-        if self.ser and self.ser.is_open:
-            self.ser.close()
+        if self.reader:
+            self.reader.stop()
         super().destroy_node()
 
 

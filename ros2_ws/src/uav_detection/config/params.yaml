@@ -1,36 +1,38 @@
 # Interstellar Foundry — UAV Detection System
 # ROS2 parameter configuration
 # Platform: ROS2 Humble · Ubuntu 22.04 · Jetson Orin Nano
+#
+# Hardware:
+#   Radar  : FM24-NP100 24GHz mmWave → UART /dev/ttyTHS1 @ 57600 baud
+#   Camera : Luxonis OAK-D Pro → USB3 (depthai 3.5.0)
 
 radar_node:
   ros__parameters:
-    serial_port: /dev/ttyTHS1   # UART port on Jetson (Jetson ttyTHS1 = 40-pin header UART)
-    baud_rate: 115200
-    frame_id: radar_frame
+    serial_port:     /dev/ttyTHS1   # Jetson 40-pin UART (pins 8 TX / 10 RX)
+    baud_rate:       57600          # FM24-NP100 default baud rate
+    frame_id:        radar_frame
     publish_rate_hz: 10.0
-    sim_mode: false             # Set true for Mac dev / testing without hardware
+    sim_mode:        false          # set true for Mac dev / no hardware
 
 camera_node:
   ros__parameters:
     frame_id: camera_frame
-    fps: 30
-    width: 640
-    height: 400
+    fps:      30                    # OAK-D Pro max reliable rate
     sim_mode: false
 
 fusion_node:
   ros__parameters:
-    depth_match_threshold_m: 1.5   # Max radar-camera range diff for cross-validation
-    radar_buffer_sec: 0.5          # How long to keep radar points in memory
-    min_snr: 0.4                   # Minimum radar signal-to-noise to process
+    depth_match_threshold_m: 2.0   # radar vs camera range tolerance (m)
+    radar_stale_sec:         1.0   # ignore radar frames older than this
+    min_peak_amp:            2.0   # minimum FM24-NP100 spectral peak amplitude
 
 detection_node:
   ros__parameters:
-    snr_threshold: 0.5             # Minimum SNR for classification
-    depth_validated_bonus: 0.15    # Confidence boost when camera confirms radar
-    alert_range_m: 20.0            # Within this range → THREAT alert
+    snr_threshold:        0.5
+    depth_validated_bonus: 0.15
+    alert_range_m:        20.0     # FM24-NP100 max detection range
 
 dashboard_bridge:
   ros__parameters:
-    ws_port: 9090                  # WebSocket port for dashboard
-    broadcast_rate_hz: 5.0         # How often to push state to browser
+    ws_port:           9090
+    broadcast_rate_hz: 5.0

@@ -3,188 +3,166 @@
 dashboard_bridge.py
 Interstellar Foundry — Team 7
 
-Aggregates data from all ROS2 topics and broadcasts it via WebSocket
-on port 9090 so the web dashboard (dashboard/index.html) can display
-live data from any browser on the same network.
+Aggregates all ROS2 topics and streams live JSON to the web dashboard
+(dashboard/index.html) via WebSocket on port 9090.
 
-Platform: ROS2 Humble · Ubuntu 22.04
-Dependencies: pip install websockets psutil
+Spectrum data from the FM24-NP100 (126 bins) is forwarded so the
+dashboard can render the FMCW spectrum bar in real-time.
+
+Platform : ROS2 Humble · Ubuntu 22.04
+pip deps  : pip3 install websockets psutil
 """
 
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
-import asyncio
-import websockets
-import json
-import time
-import threading
-import psutil
+import asyncio, websockets, json, time, threading, psutil
 
 
 class DashboardBridge(Node):
-    """
-    Subscribes to all relevant topics and re-broadcasts as JSON over WebSocket.
-    The HTML dashboard connects to ws://<jetson-ip>:9090.
-    """
 
     def __init__(self):
         super().__init__('dashboard_bridge')
 
-        self.declare_parameter('ws_port', 9090)
+        self.declare_parameter('ws_port',          9090)
         self.declare_parameter('broadcast_rate_hz', 5.0)
 
-        self.ws_port = self.get_parameter('ws_port').value
-        self.rate_hz = self.get_parameter('broadcast_rate_hz').value
+        self.ws_port  = self.get_parameter('ws_port').value
+        self.rate_hz  = self.get_parameter('broadcast_rate_hz').value
 
-        # Shared state (thread-safe via simple dict + GIL for Python)
         self.state = {
-            'detections': [],
-            'telemetry': {},
-            'radar_telem': {},
-            'camera_telem': {},
-            'session_start': time.time(),
+            'detections':       [],
             'total_detections': 0,
-            'active_threats': 0,
+            'active_threats':   0,
+            'radar_telem':      {},   # includes spectrum list from FM24-NP100
+            'camera_telem':     {},
+            'hw_telem':         {},
+            'session_start':    time.time(),
         }
+        self.clients: set = set()
 
-        self.connected_clients: set = set()
-
-        # --- ROS2 Subscribers ---
         self.create_subscription(String, '/detections/classified', self._on_classified, 10)
-        self.create_subscription(String, '/radar/telemetry', self._on_radar_telem, 10)
-        self.create_subscription(String, '/camera/telemetry', self._on_camera_telem, 10)
+        self.create_subscription(String, '/radar/telemetry',       self._on_radar,      10)
+        self.create_subscription(String, '/camera/telemetry',      self._on_camera,     10)
 
-        # --- Timer for hardware telemetry ---
-        self.create_timer(2.0, self._update_hw_telem)
+        self.create_timer(2.0,              self._update_hw)
+        self.create_timer(1.0 / self.rate_hz, self._broadcast_sync)
 
-        # --- Start WebSocket server in background thread ---
-        self.ws_thread = threading.Thread(target=self._start_ws_server, daemon=True)
-        self.ws_thread.start()
+        # WebSocket server runs in its own thread with its own event loop
+        self._loop = asyncio.new_event_loop()
+        self._ws_thread = threading.Thread(target=self._start_ws, daemon=True)
+        self._ws_thread.start()
 
-        # --- Broadcast timer ---
-        self.create_timer(1.0 / self.rate_hz, self._broadcast_state)
-
-        self.get_logger().info(f'DashboardBridge started — ws://0.0.0.0:{self.ws_port}')
+        self.get_logger().info(f'DashboardBridge ready – ws://0.0.0.0:{self.ws_port}')
 
     # ------------------------------------------------------------------ #
-    # ROS2 Callbacks                                                       #
+    # ROS2 callbacks                                                       #
     # ------------------------------------------------------------------ #
 
     def _on_classified(self, msg: String):
         try:
-            data = json.loads(msg.data)
+            data   = json.loads(msg.data)
             events = data.get('events', [])
-            # Keep last 50 detections
-            self.state['detections'] = (events + self.state['detections'])[:50]
+            self.state['detections']       = (events + self.state['detections'])[:50]
             self.state['total_detections'] += len(events)
-            self.state['active_threats'] = sum(
-                1 for e in self.state['detections'][:10] if e.get('alert_level') == 'THREAT'
+            self.state['active_threats']   = sum(
+                1 for e in self.state['detections'][:10]
+                if e.get('alert_level') == 'THREAT'
             )
-        except Exception as e:
-            self.get_logger().warn(f'Bridge parse error (classified): {e}')
+        except Exception:
+            pass
 
-    def _on_radar_telem(self, msg: String):
+    def _on_radar(self, msg: String):
         try:
             self.state['radar_telem'] = json.loads(msg.data)
         except Exception:
             pass
 
-    def _on_camera_telem(self, msg: String):
+    def _on_camera(self, msg: String):
         try:
             self.state['camera_telem'] = json.loads(msg.data)
         except Exception:
             pass
 
-    def _update_hw_telem(self):
-        """Pull Jetson hardware stats via psutil."""
+    def _update_hw(self):
         try:
-            mem = psutil.virtual_memory()
-            cpu_temp = None
+            mem  = psutil.virtual_memory()
+            temp = None
             try:
-                temps = psutil.sensors_temperatures()
                 for key in ('thermal_fan_est', 'cpu_thermal', 'coretemp'):
-                    if key in temps and temps[key]:
-                        cpu_temp = temps[key][0].current
+                    t = psutil.sensors_temperatures().get(key)
+                    if t:
+                        temp = t[0].current
                         break
             except Exception:
                 pass
+            bat = None
+            try:
+                b = psutil.sensors_battery()
+                bat = round(b.percent, 1) if b else None
+            except Exception:
+                pass
 
-            self.state['telemetry'] = {
-                'cpu_percent': psutil.cpu_percent(interval=None),
-                'ram_used_gb': round(mem.used / 1e9, 2),
+            self.state['hw_telem'] = {
+                'cpu_percent':  psutil.cpu_percent(interval=None),
+                'ram_used_gb':  round(mem.used  / 1e9, 2),
                 'ram_total_gb': round(mem.total / 1e9, 2),
-                'cpu_temp_c': cpu_temp,
-                'battery_percent': self._get_battery(),
-                'uptime_sec': int(time.time() - self.state['session_start']),
-                'timestamp': time.time(),
+                'cpu_temp_c':   temp,
+                'battery_percent': bat,
+                'uptime_sec':   int(time.time() - self.state['session_start']),
+                'timestamp':    time.time(),
             }
-        except Exception as e:
-            self.get_logger().warn(f'HW telem error: {e}')
-
-    def _get_battery(self):
-        try:
-            b = psutil.sensors_battery()
-            return round(b.percent, 1) if b else None
         except Exception:
-            return None
+            pass
 
     # ------------------------------------------------------------------ #
-    # WebSocket Server                                                     #
+    # WebSocket                                                            #
     # ------------------------------------------------------------------ #
 
-    def _start_ws_server(self):
-        asyncio.run(self._ws_main())
+    def _start_ws(self):
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._ws_main())
 
     async def _ws_main(self):
-        async with websockets.serve(self._ws_handler, '0.0.0.0', self.ws_port):
-            self.get_logger().info(f'WebSocket server listening on :{self.ws_port}')
-            await asyncio.Future()  # run forever
+        async with websockets.serve(self._handler, '0.0.0.0', self.ws_port):
+            await asyncio.Future()
 
-    async def _ws_handler(self, websocket):
-        client = websocket.remote_address
-        self.connected_clients.add(websocket)
-        self.get_logger().info(f'Dashboard client connected: {client}')
+    async def _handler(self, ws):
+        self.clients.add(ws)
+        self.get_logger().info(f'Dashboard connected: {ws.remote_address}')
         try:
-            async for _ in websocket:
-                pass  # We don't expect incoming messages from the dashboard
+            async for _ in ws:
+                pass
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
-            self.connected_clients.discard(websocket)
-            self.get_logger().info(f'Dashboard client disconnected: {client}')
+            self.clients.discard(ws)
 
-    def _broadcast_state(self):
-        """Push current state to all connected WebSocket clients."""
-        if not self.connected_clients:
+    def _broadcast_sync(self):
+        if not self.clients:
             return
-
+        s = self.state
         payload = json.dumps({
-            'type': 'state_update',
-            'timestamp': time.time(),
-            'total_detections': self.state['total_detections'],
-            'active_threats': self.state['active_threats'],
-            'recent_events': self.state['detections'][:10],
-            'telemetry': self.state['telemetry'],
-            'radar_telem': self.state['radar_telem'],
-            'camera_telem': self.state['camera_telem'],
-            'uptime_sec': int(time.time() - self.state['session_start']),
+            'type':             'state_update',
+            'timestamp':        time.time(),
+            'total_detections': s['total_detections'],
+            'active_threats':   s['active_threats'],
+            'recent_events':    s['detections'][:10],
+            'telemetry':        s['hw_telem'],
+            'radar_telem':      s['radar_telem'],   # contains spectrum[], distance_m, mode, etc.
+            'camera_telem':     s['camera_telem'],
+            'uptime_sec':       int(time.time() - s['session_start']),
         })
+        asyncio.run_coroutine_threadsafe(self._broadcast(payload), self._loop)
 
-        # Schedule async broadcast on the ws event loop
-        asyncio.run_coroutine_threadsafe(
-            self._async_broadcast(payload),
-            asyncio.get_event_loop()
-        )
-
-    async def _async_broadcast(self, payload: str):
+    async def _broadcast(self, payload: str):
         dead = set()
-        for ws in self.connected_clients:
+        for ws in list(self.clients):
             try:
                 await ws.send(payload)
             except Exception:
                 dead.add(ws)
-        self.connected_clients -= dead
+        self.clients -= dead
 
 
 def main(args=None):

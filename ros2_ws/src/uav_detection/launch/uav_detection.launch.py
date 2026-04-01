@@ -2,10 +2,16 @@
 uav_detection.launch.py
 Interstellar Foundry — Team 7
 
-Launches all nodes in the UAV detection pipeline.
-Run with:
-    ros2 launch uav_detection uav_detection.launch.py
-    ros2 launch uav_detection uav_detection.launch.py sim_mode:=true
+Launches the full UAV detection pipeline.
+
+Hardware:
+  Radar  : FM24-NP100 24GHz mmWave → /dev/ttyTHS1 @ 57600 baud
+  Camera : Luxonis OAK-D Pro (depthai 3.5.0)
+  Compute: Jetson Orin Nano · Ubuntu 22.04 · ROS2 Humble
+
+Usage:
+  ros2 launch uav_detection uav_detection.launch.py
+  ros2 launch uav_detection uav_detection.launch.py sim_mode:=true
 """
 
 from launch import LaunchDescription
@@ -15,35 +21,32 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    sim_mode_arg = DeclareLaunchArgument(
+    sim_arg = DeclareLaunchArgument(
         'sim_mode',
         default_value='false',
-        description='Run in simulation mode (no hardware required, useful for Mac dev via Docker)'
+        description='Simulation mode — no hardware needed (good for Mac dev via Docker)'
     )
     sim_mode = LaunchConfiguration('sim_mode')
 
     return LaunchDescription([
-        sim_mode_arg,
+        sim_arg,
+        LogInfo(msg='=== Interstellar Foundry — UAV Detection Pipeline ==='),
+        LogInfo(msg=['Radar: FM24-NP100 @ /dev/ttyTHS1 57600 baud | sim=', sim_mode]),
 
-        LogInfo(msg='=== Interstellar Foundry — UAV Detection System ==='),
-        LogInfo(msg=['Simulation mode: ', sim_mode]),
-
-        # --- Radar Node ---
         Node(
             package='uav_detection',
             executable='radar_node',
             name='radar_node',
             output='screen',
             parameters=[{
-                'serial_port': '/dev/ttyTHS1',
-                'baud_rate': 115200,
-                'frame_id': 'radar_frame',
+                'serial_port':     '/dev/ttyTHS1',
+                'baud_rate':       57600,
+                'frame_id':        'radar_frame',
                 'publish_rate_hz': 10.0,
-                'sim_mode': sim_mode,
+                'sim_mode':        sim_mode,
             }]
         ),
 
-        # --- Camera Node ---
         Node(
             package='uav_detection',
             executable='camera_node',
@@ -51,47 +54,42 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'frame_id': 'camera_frame',
-                'fps': 30,
-                'width': 640,
-                'height': 400,
+                'fps':      30,
                 'sim_mode': sim_mode,
             }]
         ),
 
-        # --- Fusion Node ---
         Node(
             package='uav_detection',
             executable='fusion_node',
             name='fusion_node',
             output='screen',
             parameters=[{
-                'depth_match_threshold_m': 1.5,
-                'radar_buffer_sec': 0.5,
-                'min_snr': 0.4,
+                'depth_match_threshold_m': 2.0,
+                'radar_stale_sec':         1.0,
+                'min_peak_amp':            2.0,
             }]
         ),
 
-        # --- Detection / Classification Node ---
         Node(
             package='uav_detection',
             executable='detection_node',
             name='detection_node',
             output='screen',
             parameters=[{
-                'snr_threshold': 0.5,
+                'snr_threshold':        0.5,
                 'depth_validated_bonus': 0.15,
-                'alert_range_m': 20.0,
+                'alert_range_m':        20.0,
             }]
         ),
 
-        # --- Dashboard WebSocket Bridge ---
         Node(
             package='uav_detection',
             executable='dashboard_bridge',
             name='dashboard_bridge',
             output='screen',
             parameters=[{
-                'ws_port': 9090,
+                'ws_port':           9090,
                 'broadcast_rate_hz': 5.0,
             }]
         ),

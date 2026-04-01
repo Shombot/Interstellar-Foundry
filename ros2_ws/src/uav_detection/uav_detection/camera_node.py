@@ -3,182 +3,177 @@
 camera_node.py
 Interstellar Foundry — Team 7
 
-Reads RGB + depth frames from the OAK-D Pro camera via DepthAI
-and publishes them to ROS2 topics.
+ROS2 Humble node for the Luxonis OAK-D Pro camera.
+Uses the depthai 3.5.0 API matching radar_camera_fusion.py exactly:
+  pipeline.create(dai.node.Camera).build(socket)
+  cam.requestOutput(size, type, fps)
+  output.createOutputQueue()          <-- no XLinkOut nodes
 
-Hardware: Luxonis OAK-D Pro → Jetson Orin Nano (USB3)
-Platform: ROS2 Humble · Ubuntu 22.04
+Hardware : OAK-D Pro → Jetson Orin Nano (USB3 blue port)
+Platform : ROS2 Humble · Ubuntu 22.04 · depthai 3.5.0
 """
+
+import time, json
+import numpy as np
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import Header, String
-import json
-import time
-import numpy as np
+
+# depthai 3.5.0 resolution constants (match radar_camera_fusion.py)
+RGB_W,   RGB_H   = 640, 480
+DEPTH_W, DEPTH_H = 640, 400
 
 
 class CameraNode(Node):
     """
-    Captures OAK-D Pro RGB and depth frames.
     Publishes:
-        /camera/rgb   (sensor_msgs/Image)
-        /camera/depth (sensor_msgs/Image)
+        /camera/rgb       sensor_msgs/Image  (BGR888, 640×480)
+        /camera/depth     sensor_msgs/Image  (uint16 mm, 640×480)
+        /camera/telemetry std_msgs/String    JSON health info
     """
 
     def __init__(self):
         super().__init__('camera_node')
 
-        # --- Parameters ---
         self.declare_parameter('frame_id', 'camera_frame')
-        self.declare_parameter('fps', 30)
-        self.declare_parameter('width', 640)
-        self.declare_parameter('height', 400)
+        self.declare_parameter('fps',      30)
         self.declare_parameter('sim_mode', False)
 
         self.frame_id = self.get_parameter('frame_id').value
-        self.fps = self.get_parameter('fps').value
-        self.width = self.get_parameter('width').value
-        self.height = self.get_parameter('height').value
+        self.fps      = self.get_parameter('fps').value
         self.sim_mode = self.get_parameter('sim_mode').value
 
-        # --- Publishers ---
-        self.pub_rgb = self.create_publisher(Image, '/camera/rgb', 10)
-        self.pub_depth = self.create_publisher(Image, '/camera/depth', 10)
+        self.pub_rgb   = self.create_publisher(Image,  '/camera/rgb',       10)
+        self.pub_depth = self.create_publisher(Image,  '/camera/depth',     10)
         self.pub_telem = self.create_publisher(String, '/camera/telemetry', 10)
 
-        # --- DepthAI pipeline ---
         self.pipeline = None
-        self.device = None
+        self.rgbQ     = None
+        self.dispQ    = None
 
         if not self.sim_mode:
-            self._init_oak_pipeline()
+            self._init_oak()
         else:
-            self.get_logger().warn('Camera running in SIMULATION MODE.')
+            self.get_logger().warn('CameraNode: SIMULATION MODE – no OAK-D hardware required.')
 
-        # --- Timer ---
-        self.timer = self.create_timer(1.0 / self.fps, self.timer_callback)
         self.frame_count = 0
-
+        self.create_timer(1.0 / self.fps, self._cb)
         self.get_logger().info(
-            f'CameraNode started | {self.width}x{self.height} @ {self.fps}fps | sim={self.sim_mode}'
-        )
+            f'CameraNode ready | {RGB_W}×{RGB_H} @ {self.fps}fps | sim={self.sim_mode}')
 
-    def _init_oak_pipeline(self):
-        """Initialize the OAK-D DepthAI pipeline."""
+    # ------------------------------------------------------------------
+    # depthai 3.5.0 pipeline  (mirrors build_oak_pipeline() exactly)
+    # ------------------------------------------------------------------
+    def _init_oak(self):
         try:
             import depthai as dai
 
             pipeline = dai.Pipeline()
 
-            # RGB camera
-            cam_rgb = pipeline.create(dai.node.ColorCamera)
-            cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-            cam_rgb.setInterleaved(False)
-            cam_rgb.setFps(self.fps)
+            # RGB – CAM_A
+            camRgb    = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+            rgbOutput = camRgb.requestOutput(
+                (RGB_W, RGB_H), dai.ImgFrame.Type.BGR888p, fps=float(self.fps))
 
-            # Left + Right mono (for depth)
-            mono_left = pipeline.create(dai.node.MonoCamera)
-            mono_right = pipeline.create(dai.node.MonoCamera)
-            mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-            mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-            mono_left.setBoardSocket(dai.CameraBoardSocket.LEFT)
-            mono_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+            # Stereo pair
+            left       = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
+            leftOutput = left.requestOutput((DEPTH_W, DEPTH_H), dai.ImgFrame.Type.GRAY8,
+                                            fps=float(self.fps))
+            right       = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
+            rightOutput = right.requestOutput((DEPTH_W, DEPTH_H), dai.ImgFrame.Type.GRAY8,
+                                              fps=float(self.fps))
 
             # Stereo depth
             stereo = pipeline.create(dai.node.StereoDepth)
-            stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
-            mono_left.out.link(stereo.left)
-            mono_right.out.link(stereo.right)
+            stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_DENSITY)
+            stereo.setLeftRightCheck(True)
+            stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
+            stereo.setOutputSize(RGB_W, RGB_H)
 
-            # XLink outputs
-            xout_rgb = pipeline.create(dai.node.XLinkOut)
-            xout_depth = pipeline.create(dai.node.XLinkOut)
-            xout_rgb.setStreamName('rgb')
-            xout_depth.setStreamName('depth')
+            leftOutput.link(stereo.left)
+            rightOutput.link(stereo.right)
 
-            cam_rgb.video.link(xout_rgb.input)
-            stereo.depth.link(xout_depth.input)
+            # Output queues – depthai 3.5 style (no XLinkOut)
+            self.rgbQ  = rgbOutput.createOutputQueue()
+            self.dispQ = stereo.disparity.createOutputQueue()
 
+            pipeline.start()
             self.pipeline = pipeline
-            self.device = dai.Device(pipeline)
-            self.q_rgb = self.device.getOutputQueue('rgb', maxSize=4, blocking=False)
-            self.q_depth = self.device.getOutputQueue('depth', maxSize=4, blocking=False)
-
-            self.get_logger().info('OAK-D Pro pipeline initialized.')
+            self.get_logger().info('OAK-D Pro pipeline (depthai 3.5.0) started.')
 
         except ImportError:
-            self.get_logger().error('depthai not installed. Run: pip install depthai')
+            self.get_logger().error('depthai not installed. Run: pip3 install depthai==3.5.0')
             self.sim_mode = True
         except Exception as e:
-            self.get_logger().error(f'OAK-D init error: {e}')
+            self.get_logger().error(f'OAK-D init failed: {e} – falling back to sim mode.')
             self.sim_mode = True
 
-    def timer_callback(self):
-        if self.sim_mode:
-            rgb_arr, depth_arr = self._generate_sim_frames()
+    # ------------------------------------------------------------------
+    def _cb(self):
+        if self.sim_mode or self.pipeline is None:
+            rgb_arr, depth_arr = self._sim_frames()
         else:
-            rgb_arr, depth_arr = self._capture_frames()
+            rgb_arr, depth_arr = self._capture()
 
         if rgb_arr is not None:
-            self.pub_rgb.publish(self._np_to_image(rgb_arr, 'rgb8'))
+            self.pub_rgb.publish(self._to_image(rgb_arr, 'bgr8'))
         if depth_arr is not None:
-            self.pub_depth.publish(self._np_to_image(depth_arr, '16UC1'))
+            self.pub_depth.publish(self._to_image(depth_arr, '16UC1'))
 
-        telem = {
-            'timestamp': time.time(),
-            'frame_count': self.frame_count,
-            'sim_mode': self.sim_mode,
-            'fps': self.fps,
-        }
         msg = String()
-        msg.data = json.dumps(telem)
+        msg.data = json.dumps({
+            'timestamp':   time.time(),
+            'frame_count': self.frame_count,
+            'fps':         self.fps,
+            'sim_mode':    self.sim_mode,
+        })
         self.pub_telem.publish(msg)
         self.frame_count += 1
 
-    def _capture_frames(self):
-        """Pull latest frames from the OAK-D queue."""
+    def _capture(self):
         try:
-            in_rgb = self.q_rgb.tryGet()
-            in_depth = self.q_depth.tryGet()
-            rgb = in_rgb.getCvFrame() if in_rgb else None
-            depth = in_depth.getFrame() if in_depth else None
+            rgb_msg  = self.rgbQ.tryGet()
+            disp_msg = self.dispQ.tryGet()
+            rgb   = rgb_msg.getCvFrame()  if rgb_msg  else None
+            depth = disp_msg.getFrame()   if disp_msg else None
             return rgb, depth
         except Exception as e:
             self.get_logger().warn(f'Frame capture error: {e}')
             return None, None
 
-    def _generate_sim_frames(self):
-        """Generate placeholder frames for development."""
-        rgb = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-        depth = np.zeros((self.height, self.width), dtype=np.uint16)
-        # Add a moving dot to simulate a target
-        t = time.time()
-        cx = int(self.width * (0.5 + 0.3 * np.sin(t * 0.5)))
-        cy = int(self.height * (0.5 + 0.2 * np.cos(t * 0.4)))
-        rgb[max(0, cy-10):cy+10, max(0, cx-10):cx+10] = [0, 212, 255]
-        depth[max(0, cy-10):cy+10, max(0, cx-10):cx+10] = 8000  # ~8m
+    def _sim_frames(self):
+        rgb   = np.zeros((RGB_H, RGB_W, 3), dtype=np.uint8)
+        depth = np.zeros((RGB_H, RGB_W),    dtype=np.uint16)
+        t  = time.time()
+        cx = int(RGB_W * (0.5 + 0.3 * np.sin(t * 0.5)))
+        cy = int(RGB_H * (0.5 + 0.2 * np.cos(t * 0.4)))
+        rgb  [max(0,cy-10):cy+10, max(0,cx-10):cx+10] = [0, 212, 255]
+        depth[max(0,cy-10):cy+10, max(0,cx-10):cx+10] = 8000
         return rgb, depth
 
-    def _np_to_image(self, arr: np.ndarray, encoding: str) -> Image:
-        msg = Image()
-        msg.header = Header()
-        msg.header.stamp = self.get_clock().now().to_msg()
+    def _to_image(self, arr: np.ndarray, encoding: str) -> Image:
+        msg            = Image()
+        msg.header     = Header()
+        msg.header.stamp    = self.get_clock().now().to_msg()
         msg.header.frame_id = self.frame_id
-        msg.encoding = encoding
+        msg.encoding   = encoding
         if arr.ndim == 3:
-            msg.height, msg.width, _ = arr.shape
-            msg.step = arr.shape[1] * arr.shape[2]
+            msg.height, msg.width, ch = arr.shape
+            msg.step = msg.width * ch
         else:
             msg.height, msg.width = arr.shape
-            msg.step = arr.shape[1] * 2  # uint16
+            msg.step = msg.width * 2
         msg.data = arr.tobytes()
         return msg
 
     def destroy_node(self):
-        if self.device:
-            self.device.close()
+        if self.pipeline:
+            try:
+                self.pipeline.stop()
+            except Exception:
+                pass
         super().destroy_node()
 
 
