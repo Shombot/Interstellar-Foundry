@@ -48,7 +48,7 @@ GRAY = (200, 200, 200)
 MAGENTA = (255, 0, 255)
 ORANGE = (0, 140, 255)
 
-DRONE_THRESHOLD = 0.45
+DRONE_THRESHOLD = 0.35
 
 # COCO classes that are definitively NOT drones
 NON_DRONE_CLASSES = {
@@ -230,7 +230,7 @@ class RadarDroneAnalyzer:
         dist_m = radar_data['distance_m']
         self.spectral_history.append(spectrum.copy())
 
-        noise_floor = 2.5
+        noise_floor = 1.5
         active_bins = np.sum(spectrum > noise_floor)
         active_ratio = active_bins / SPECTRAL_BINS
 
@@ -269,7 +269,7 @@ class RadarDroneAnalyzer:
             score += 0.25
 
         self.confidence = min(score, 1.0)
-        self.drone_detected = self.confidence > 0.40
+        self.drone_detected = self.confidence > 0.25
 
         info = (f"bins:{active_bins} spread:{spectral_spread} "
                 f"var:{temporal_var:.1f} conf:{self.confidence:.0%}")
@@ -420,13 +420,20 @@ def draw_hud(frame, num_drones, radar_data, radar_detected, radar_conf,
 
 
 def draw_radar_hud(frame, data):
-    elapsed = time.time() - data['last_frame'] if data['last_frame'] else float('inf')
-    status = "LIVE" if elapsed < 2.0 else "STALE"
-    target = "TGT" if data.get('target_present') else "---"
-
     overlay = frame.copy()
     cv2.rectangle(overlay, (5, 5), (260, 55), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+    if data is None or data.get('mode') is None:
+        cv2.putText(frame, "RADAR --- [NO DETECTION]", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, GRAY, 1)
+        cv2.putText(frame, "Range: 0.00 m", (10, 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, GRAY, 1)
+        return frame
+
+    elapsed = time.time() - data['last_frame'] if data['last_frame'] else float('inf')
+    status = "LIVE" if elapsed < 2.0 else "STALE"
+    target = "TGT" if data.get('target_present') else "---"
 
     cv2.putText(frame, f"RADAR {status} [{target}]", (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5,
@@ -464,7 +471,8 @@ def draw_spectrum_bar(frame, spectrum):
     return frame
 
 
-def draw_radar_table(panel, radar_data):
+def draw_radar_table(panel, radar_data, radar_detected=False, radar_conf=0.0,
+                     radar_info=""):
     """Draw a compact radar values table on the depth side-panel."""
     h, w = panel.shape[:2]
 
@@ -483,11 +491,20 @@ def draw_radar_table(panel, radar_data):
 
     peak_bin = int(np.argmax(spectrum)) if np.any(spectrum > 0) else 0
     peak_amp = float(spectrum[peak_bin]) if np.any(spectrum > 0) else 0.0
-    active_bins = int(np.sum(spectrum > 2.5))
+    noise_floor = 1.5
+    active_bins = int(np.sum(spectrum > noise_floor))
+    active_ratio = active_bins / SPECTRAL_BINS
     mean_amp = float(np.mean(spectrum[spectrum > 0])) if np.any(spectrum > 0) else 0.0
 
+    # Spectral spread
+    if np.any(spectrum > noise_floor):
+        active_indices = np.where(spectrum > noise_floor)[0]
+        spectral_spread = int(active_indices[-1] - active_indices[0]) if len(active_indices) > 1 else 0
+    else:
+        spectral_spread = 0
+
     # Table background
-    table_h = 155
+    table_h = 225
     table_y = h - table_h - 5
     overlay = panel.copy()
     cv2.rectangle(overlay, (3, table_y), (w - 3, h - 3), (0, 0, 0), -1)
@@ -516,6 +533,8 @@ def draw_radar_table(panel, radar_data):
         ("Peak Bin",  f"{peak_bin}"),
         ("Peak Amp",  f"{peak_amp:.1f} / {MAX_SPECTRAL_VAL}"),
         ("Active",    f"{active_bins} / {SPECTRAL_BINS} bins"),
+        ("Active %",  f"{active_ratio:.0%}"),
+        ("Spread",    f"{spectral_spread} bins"),
         ("Mean Amp",  f"{mean_amp:.1f}"),
     ]
 
@@ -528,6 +547,34 @@ def draw_radar_table(panel, radar_data):
             val_clr = GREEN if dist_m < 5 else YELLOW if dist_m < 15 else RED
         cv2.putText(panel, value, (x_val, y), font, fs, val_clr, 1)
         y += lh
+
+    # --- Drone analysis section ---
+    y += 4
+    cv2.line(panel, (x_lbl, y), (w - 10, y), (80, 80, 80), 1)
+    y += 12
+    cv2.putText(panel, "DRONE ANALYSIS", (x_lbl, y), font, 0.35, MAGENTA, 1)
+    y += lh
+
+    drone_label = "DETECTED" if radar_detected else "---"
+    drone_clr = RED if radar_detected else GRAY
+    cv2.putText(panel, "uDoppler", (x_lbl, y), font, fs, GRAY, 1)
+    cv2.putText(panel, drone_label, (x_val, y), font, fs, drone_clr, 1)
+    y += lh
+
+    conf_pct = f"{radar_conf:.0%}"
+    conf_clr = RED if radar_conf >= 0.5 else ORANGE if radar_conf >= 0.25 else GREEN
+    cv2.putText(panel, "Drone Conf", (x_lbl, y), font, fs, GRAY, 1)
+    cv2.putText(panel, conf_pct, (x_val, y), font, fs, conf_clr, 1)
+    y += lh
+
+    # Confidence bar
+    bar_w = w - x_lbl - 15
+    cv2.rectangle(panel, (x_lbl, y), (x_lbl + bar_w, y + 8), (50, 50, 50), -1)
+    fill_w = int(bar_w * radar_conf)
+    cv2.rectangle(panel, (x_lbl, y), (x_lbl + fill_w, y + 8), conf_clr, -1)
+    # Threshold marker
+    thresh_x = x_lbl + int(bar_w * DRONE_THRESHOLD)
+    cv2.line(panel, (thresh_x, y - 2), (thresh_x, y + 10), WHITE, 1)
 
     return panel
 
@@ -832,8 +879,8 @@ def main():
                                   radar_detected, radar_conf, radar_info,
                                   detection_mode, nn_det_count)
 
+            main_panel = draw_radar_hud(main_panel, radar_data)
             if radar_data is not None and radar_data.get('mode') is not None:
-                main_panel = draw_radar_hud(main_panel, radar_data)
                 main_panel = draw_spectrum_bar(main_panel, radar_data['spectrum'])
 
             if has_depth:
@@ -854,8 +901,25 @@ def main():
                 cv2.putText(depth_panel, "NO DEPTH", (40, 240),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, RED, 1)
 
+            # Live radar distance readout at top of side panel
+            if radar_data is not None and radar_data.get('mode') is not None:
+                dist_m = radar_data['distance_m']
+                tgt = radar_data.get('target_present', False)
+                overlay = depth_panel.copy()
+                cv2.rectangle(overlay, (3, 30), (DEPTH_W - 3, 80), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.7, depth_panel, 0.3, 0, depth_panel)
+                cv2.putText(depth_panel, "RADAR DIST", (8, 46),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, CYAN, 1)
+                dist_clr = GREEN if dist_m < 5 else YELLOW if dist_m < 15 else RED
+                if not tgt:
+                    dist_clr = GRAY
+                cv2.putText(depth_panel, f"{dist_m:.2f} m",
+                            (8, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.8, dist_clr, 2)
+
             # Radar values table on depth side-panel
-            depth_panel = draw_radar_table(depth_panel, radar_data)
+            depth_panel = draw_radar_table(depth_panel, radar_data,
+                                           radar_detected, radar_conf,
+                                           radar_info)
 
             canvas = np.hstack([main_panel, depth_panel])
 
