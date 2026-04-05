@@ -23,14 +23,14 @@ import sys
 import os
 import time
 import json
-from collections import deque
+# from collections import deque
 from pathlib import Path
 
 import numpy as np
 import cv2
 
-sys.path.insert(0, os.path.expanduser("~"))
-from radar_display import RadarReader, SPECTRAL_BINS, MAX_SPECTRAL_VAL
+# sys.path.insert(0, os.path.expanduser("~"))
+# from radar_display import RadarReader, SPECTRAL_BINS, MAX_SPECTRAL_VAL
 
 # Layout
 MAIN_W, MAIN_H = 640, 480
@@ -48,28 +48,18 @@ GRAY = (200, 200, 200)
 MAGENTA = (255, 0, 255)
 ORANGE = (0, 140, 255)
 
-DRONE_THRESHOLD = 0.35
+DRONE_THRESHOLD = 0.30
 
-# COCO classes that are definitively NOT drones
-NON_DRONE_CLASSES = {
-    0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13,   # person, vehicles, street
-    15, 16, 17, 18, 19, 20, 21, 22, 23,             # animals
-    24, 25, 26, 27,                                   # accessories
-    39, 40, 41, 42, 43, 44, 45,                      # kitchen
-    46, 47, 48, 49, 50, 51, 52, 53, 54, 55,         # food
-    56, 57, 58, 59, 60, 61,                          # furniture
-    62, 63, 64, 65, 66, 67,                          # electronics
-    68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, # appliances, misc
+# COCO classes that are airborne / could be a drone — only these show on display
+FLYING_CLASSES = {
+    4,   # airplane
+    14,  # bird
+    29,  # frisbee — disc shape in air
+    33,  # kite
 }
 
-# COCO classes that could be confused with a drone (ambiguous)
-DRONE_AMBIGUOUS_CLASSES = {
-    4,   # airplane — small aircraft silhouette similar to drone
-    14,  # bird — flies, similar size, key false positive
-    29,  # frisbee — disc shape
-    33,  # kite — airborne, similar size
-    28,  # suitcase (unlikely but rectangular airborne object)
-}
+# Everything else is a ground object — never show on dashboard
+# (person=0, bicycle=1, car=2, motorcycle=3, bus=5, train=6, truck=7, boat=8, etc.)
 
 # Model paths
 SCRIPT_DIR = Path(__file__).parent
@@ -85,268 +75,157 @@ def load_coco_labels():
 
 
 # ---------------------------------------------------------------------------
-# Centroid tracker
+# Drone tracker — multi-frame confirmation + KCF lock-on
 # ---------------------------------------------------------------------------
-class CentroidTracker:
-    def __init__(self, max_disappeared=20):
+# Requires N consistent YOLO flying-class detections in the same area
+# before classifying as drone. Once confirmed, KCF tracker maintains lock.
+CONFIRM_FRAMES = 5   # need 5 hits in the same spot before locking as drone
+
+class DroneTracker:
+    def __init__(self):
         self.next_id = 0
-        self.objects = {}
-        self.disappeared = {}
-        self.max_disappeared = max_disappeared
+        self.tracks = {}
 
-    def update(self, detections):
-        if len(detections) == 0:
-            for oid in list(self.disappeared):
-                self.disappeared[oid] += 1
-                if self.disappeared[oid] > self.max_disappeared:
-                    del self.objects[oid]
-                    del self.disappeared[oid]
-            return self.objects
+    def _init_kcf(self, frame, t):
+        """Start KCF tracker on a confirmed drone."""
+        x1 = max(0, t['cx'] - t['w'] // 2)
+        y1 = max(0, t['cy'] - t['h'] // 2)
+        w = min(t['w'], frame.shape[1] - x1)
+        h = min(t['h'], frame.shape[0] - y1)
+        if w < 5 or h < 5:
+            t['kcf'] = None
+            return
+        kcf = cv2.TrackerKCF_create()
+        kcf.init(frame, (x1, y1, w, h))
+        t['kcf'] = kcf
 
-        if len(self.objects) == 0:
-            for det in detections:
-                self.objects[self.next_id] = det
-                self.disappeared[self.next_id] = 0
-                self.next_id += 1
-            return self.objects
-
-        obj_ids = list(self.objects.keys())
-        obj_cents = np.array([(self.objects[oid][0], self.objects[oid][1])
-                              for oid in obj_ids])
-        det_cents = np.array([(d[0], d[1]) for d in detections])
-        dists = np.linalg.norm(obj_cents[:, None] - det_cents[None, :], axis=2)
-
-        used_obj, used_det, matches = set(), set(), []
-        for idx in np.argsort(dists, axis=None):
-            r, c = divmod(idx, len(detections))
-            if r in used_obj or c in used_det:
-                continue
-            if dists[r, c] > 150:
-                continue
-            matches.append((r, c))
-            used_obj.add(r)
-            used_det.add(c)
-
-        for r, c in matches:
-            oid = obj_ids[r]
-            self.objects[oid] = detections[c]
-            self.disappeared[oid] = 0
-
-        for r in range(len(obj_ids)):
-            if r not in used_obj:
-                oid = obj_ids[r]
-                self.disappeared[oid] += 1
-                if self.disappeared[oid] > self.max_disappeared:
-                    del self.objects[oid]
-                    del self.disappeared[oid]
-
-        for c in range(len(detections)):
-            if c not in used_det:
-                self.objects[self.next_id] = detections[c]
-                self.disappeared[self.next_id] = 0
-                self.next_id += 1
-
-        return self.objects
-    
-
-# ---------------------------------------------------------------------------
-# Depth range searcher — finds pixel clusters at radar distance
-# ---------------------------------------------------------------------------
-class DepthRangeSearcher:
-    def __init__(self):
-        self.min_area = 100
-        self.max_area = 25000
-        self.kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        self.kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-
-    @staticmethod
-    def compute_tolerance_mm(target_mm):
-        stereo_error = (target_mm ** 2) / (33000.0 * 8.0) * 3.0
-        return max(500.0, min(stereo_error, 4000.0))
-
-    def search(self, depth_frame_mm, target_distance_m):
-        target_mm = target_distance_m * 1000.0
-        tol_mm = self.compute_tolerance_mm(target_mm)
-
-        depth_f = depth_frame_mm.astype(np.float32)
-        mask = ((depth_f > target_mm - tol_mm) &
-                (depth_f < target_mm + tol_mm) &
-                (depth_f > 0)).astype(np.uint8) * 255
-
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel_open)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel_close)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-
-        candidates = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < self.min_area or area > self.max_area:
-                continue
-            x, y, w, h = cv2.boundingRect(cnt)
-            roi_depth = depth_frame_mm[y:y+h, x:x+w]
-            valid = roi_depth[roi_depth > 0]
-            median_depth_m = (float(np.median(valid)) / 1000.0
-                              if len(valid) > 0 else target_distance_m)
-            candidates.append((x + w // 2, y + h // 2, w, h, median_depth_m))
-
-        candidates.sort(key=lambda c: c[2] * c[3], reverse=True)
-        return candidates[:3]
-
-    def search_multi(self, depth_frame_mm, recent_distances):
-        if not recent_distances:
-            return []
-        sorted_d = sorted(set(round(d, 1) for d in recent_distances))
-        clusters, current = [], [sorted_d[0]]
-        for d in sorted_d[1:]:
-            if d - current[-1] < 1.0:
-                current.append(d)
+    def update(self, frame, detections):
+        """
+        detections: list of (cx, cy, w, h, score, depth_m, source)
+        Only YOLO flying-class detections should be fed in.
+        Returns dict of oid → (cx, cy, w, h, score, depth_m, source)
+        """
+        # Step 1: advance KCF on confirmed drones
+        for oid in list(self.tracks):
+            t = self.tracks[oid]
+            if t.get('kcf') is not None:
+                ok, bbox = t['kcf'].update(frame)
+                if ok:
+                    bx, by, bw, bh = [int(v) for v in bbox]
+                    t['cx'] = bx + bw // 2
+                    t['cy'] = by + bh // 2
+                    t['w'], t['h'] = bw, bh
+                else:
+                    t['missed'] += 1
+                    t['kcf'] = None
+            elif t['confirmed']:
+                t['missed'] += 1
             else:
-                clusters.append(np.mean(current))
-                current = [d]
-        clusters.append(np.mean(current))
+                t['missed'] += 1
 
-        all_candidates = []
-        for dist_m in clusters[:3]:
-            all_candidates.extend(self.search(depth_frame_mm, dist_m))
-        all_candidates.sort(key=lambda c: c[2] * c[3], reverse=True)
-        return all_candidates[:3]
+        # Step 2: match detections to tracks
+        used_det = set()
+        for oid in list(self.tracks):
+            t = self.tracks[oid]
+            best_dist, best_c = 200.0, -1
+            for c, det in enumerate(detections):
+                if c in used_det:
+                    continue
+                dist = ((t['cx'] - det[0])**2 + (t['cy'] - det[1])**2) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_c = c
 
+            if best_c >= 0:
+                det = detections[best_c]
+                used_det.add(best_c)
+                t['cx'], t['cy'] = det[0], det[1]
+                t['w'], t['h'] = det[2], det[3]
+                t['depth'] = det[5]
+                t['source'] = det[6]
+                t['missed'] = 0
+                t['hits'] += 1
 
-# ---------------------------------------------------------------------------
-# Radar spectral analyzer — micro-Doppler drone signature
-# ---------------------------------------------------------------------------
-class RadarDroneAnalyzer:
-    def __init__(self):
-        self.spectral_history = deque(maxlen=12)
-        self.drone_detected = False
-        self.confidence = 0.0
+                if t['confirmed']:
+                    t['score'] = max(det[4], DRONE_THRESHOLD)
+                    # Refresh KCF
+                    self._init_kcf(frame, t)
+                elif t['hits'] >= CONFIRM_FRAMES:
+                    # Enough consistent detections — confirm as drone
+                    t['confirmed'] = True
+                    t['score'] = max(det[4], DRONE_THRESHOLD)
+                    self._init_kcf(frame, t)
+                else:
+                    t['score'] = det[4]
 
-    def analyze(self, radar_data):
-        if radar_data is None or radar_data['mode'] is None:
-            return False, 0.0, "no data"
+        # Step 3: new candidate tracks
+        for c, det in enumerate(detections):
+            if c in used_det:
+                continue
+            overlaps = any(
+                abs(t['cx'] - det[0]) < max(t['w'], det[2]) and
+                abs(t['cy'] - det[1]) < max(t['h'], det[3])
+                for t in self.tracks.values())
+            if overlaps:
+                continue
 
-        spectrum = radar_data['spectrum']
-        dist_m = radar_data['distance_m']
-        self.spectral_history.append(spectrum.copy())
+            self.tracks[self.next_id] = {
+                'cx': det[0], 'cy': det[1], 'w': det[2], 'h': det[3],
+                'score': det[4], 'depth': det[5], 'source': det[6],
+                'confirmed': False, 'hits': 1, 'missed': 0, 'kcf': None,
+            }
+            self.next_id += 1
 
-        noise_floor = 1.5
-        active_bins = np.sum(spectrum > noise_floor)
-        active_ratio = active_bins / SPECTRAL_BINS
+        # Step 4: prune
+        for oid in list(self.tracks):
+            t = self.tracks[oid]
+            # Confirmed drones persist 3s, unconfirmed candidates expire fast
+            limit = 90 if t['confirmed'] else 10
+            if t['missed'] > limit:
+                del self.tracks[oid]
 
-        if np.any(spectrum > noise_floor):
-            active_indices = np.where(spectrum > noise_floor)[0]
-            spectral_spread = (active_indices[-1] - active_indices[0]
-                               if len(active_indices) > 1 else 0)
-        else:
-            spectral_spread = 0
-
-        temporal_var = 0.0
-        if len(self.spectral_history) >= 3:
-            recent = np.array(list(self.spectral_history)[-5:])
-            temporal_var = np.mean(np.var(recent, axis=0))
-
-        peak_amp = float(np.max(spectrum))
-
-        score = 0.0
-        # Multi-rotor signature: moderate spectral activity from blade returns
-        if 0.08 < active_ratio < 0.65:
-            score += 0.25
-        elif active_ratio >= 0.65:
-            score += 0.10
-        # Blade returns spread across frequency bins
-        if spectral_spread > 12:
-            score += 0.25
-        elif spectral_spread > 6:
-            score += 0.15
-        # Temporal variation from rotating blades
-        if temporal_var > 4.0:
-            score += 0.25
-        elif temporal_var > 1.5:
-            score += 0.15
-        # Target within plausible drone range with meaningful return
-        if 0.5 < dist_m < 20.0 and peak_amp > noise_floor:
-            score += 0.25
-
-        self.confidence = min(score, 1.0)
-        self.drone_detected = self.confidence > 0.25
-
-        info = (f"bins:{active_bins} spread:{spectral_spread} "
-                f"var:{temporal_var:.1f} conf:{self.confidence:.0%}")
-        return self.drone_detected, self.confidence, info
+        # Only return confirmed drones for display
+        result = {}
+        for oid, t in self.tracks.items():
+            if t['confirmed']:
+                result[oid] = (t['cx'], t['cy'], t['w'], t['h'],
+                               t['score'], t['depth'], t['source'])
+        return result
 
 
 # ---------------------------------------------------------------------------
-# YOLO + Radar + Depth fusion scorer
+# Camera-only drone scorer
 # ---------------------------------------------------------------------------
 class DroneScorer:
-    """Scores each detection as drone/not-drone using all available evidence."""
+    """Scores each detection as drone/not-drone using camera only."""
 
-    def score(self, yolo_label, yolo_conf, depth_m, radar_data,
-              radar_conf, radar_detected):
+    def score(self, yolo_label, yolo_conf, depth_m):
         """
         Returns (drone_score, reason_str).
-        drone_score: 0.0 = definitely not drone, 1.0 = definitely drone.
+        Only flying/airborne objects pass through. Ground objects → 0.
         """
-        # --- YOLO class evidence ---
-        if yolo_label is not None and yolo_label in NON_DRONE_CLASSES:
-            # YOLO confidently says this is a known non-drone object
-            if yolo_conf > 0.5:
-                return 0.05, f"YOLO:{yolo_conf:.0%} known-obj"
-            else:
-                return 0.15, f"YOLO:{yolo_conf:.0%} low-conf known"
+        # Ground object — not a drone, don't show
+        if yolo_label is not None and yolo_label not in FLYING_CLASSES:
+            return 0.0, "ground-obj"
 
-        # Bird is the primary false positive — needs radar to override
+        # Bird ��� common false positive but still show it
         if yolo_label == 14:  # bird
-            if radar_detected and radar_conf > 0.5:
-                # Radar says drone micro-Doppler despite YOLO saying bird
-                return 0.60, "bird? radar-override"
-            else:
-                return 0.10, f"bird {yolo_conf:.0%}"
+            return 0.25, f"bird {yolo_conf:.0%}"
 
-        # Airplane detection — could be a drone at distance
+        # Airplane — high drone suspicion, especially at low confidence
         if yolo_label == 4:  # airplane
-            base = 0.50 if yolo_conf < 0.6 else 0.35
-            if radar_detected:
-                base += 0.25
-            return min(base, 1.0), "airplane-like"
+            score = 0.65 if yolo_conf < 0.5 else 0.50
+            return score, "airplane-like"
 
-        # --- Unknown / unclassified object (YOLO miss or low conf) ---
-        # This is where radar + depth do the heavy lifting
-        score = 0.0
-        reason_parts = []
+        # Kite / frisbee — airborne, moderate suspicion
+        if yolo_label in (29, 33):
+            return 0.40, "airborne-obj"
 
-        # Radar micro-Doppler is the strongest drone indicator
-        if radar_detected:
-            score += 0.45
-            reason_parts.append(f"uDoppler:{radar_conf:.0%}")
-        elif radar_conf > 0.2:
-            score += radar_conf * 0.30
-            reason_parts.append(f"radar:{radar_conf:.0%}")
-
-        # Range match: depth agrees with radar
-        if radar_data and radar_data.get('target_present') and depth_m > 0:
-            range_diff = abs(depth_m - radar_data['distance_m'])
-            if range_diff < 1.0:
-                score += 0.30
-                reason_parts.append("range-match")
-            elif range_diff < 2.5:
-                score += 0.15
-                reason_parts.append("range-near")
-
-        # Object in air at radar range but YOLO can't classify it → suspicious
+        # Unknown / unclassified — YOLO missed it, could be a drone
         if yolo_label is None:
-            if radar_data and radar_data.get('target_present'):
-                score += 0.15
-                reason_parts.append("unid+radar")
-            else:
-                score += 0.05
-                reason_parts.append("unid")
-        elif yolo_label in DRONE_AMBIGUOUS_CLASSES:
-            score += 0.10
-            reason_parts.append("ambiguous-class")
+            return 0.35, "unidentified"
 
-        return min(score, 1.0), " ".join(reason_parts) if reason_parts else "low-evidence"
+        return 0.0, "low-evidence"
 
 
 # ---------------------------------------------------------------------------
@@ -376,10 +255,9 @@ def draw_drone_boxes(frame, tracker_objects):
     return frame
 
 
-def draw_hud(frame, num_drones, radar_data, radar_detected, radar_conf,
-             radar_info, detection_mode, nn_dets):
+def draw_hud(frame, num_drones, detection_mode, nn_dets):
     h, w = frame.shape[:2]
-    panel_w, panel_h = 310, 120
+    panel_w, panel_h = 310, 70
     px, py = w - panel_w - 5, 5
 
     overlay = frame.copy()
@@ -397,186 +275,90 @@ def draw_hud(frame, num_drones, radar_data, radar_detected, radar_conf,
     cv2.putText(frame, f"Mode: {detection_mode}  YOLO:{nn_dets}",
                 (px + 8, py + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.4, CYAN, 1)
 
-    if radar_data and radar_data.get('target_present'):
-        cv2.putText(frame, f"Radar: TARGET {radar_data['distance_m']:.1f}m",
-                    (px + 8, py + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.4, ORANGE, 1)
-    else:
-        cv2.putText(frame, "Radar: no target", (px + 8, py + 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, GRAY, 1)
-
-    cv2.putText(frame, f"Spectral: {radar_info}", (px + 8, py + 78),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, GRAY, 1)
-
-    bar_x, bar_y, bar_w = px + 8, py + 100, panel_w - 16
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 10),
-                  (50, 50, 50), -1)
-    fill_w = int(bar_w * radar_conf)
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + 10),
-                  RED if radar_detected else GREEN, -1)
+    cv2.putText(frame, "Radar: DISABLED", (px + 8, py + 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, GRAY, 1)
 
     if num_drones > 0 and int(time.time() * 3) % 2 == 0:
         cv2.rectangle(frame, (0, 0), (w - 1, h - 1), RED, 3)
     return frame
 
 
-def draw_radar_hud(frame, data):
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (5, 5), (260, 55), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-
-    if data is None or data.get('mode') is None:
-        cv2.putText(frame, "RADAR --- [NO DETECTION]", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, GRAY, 1)
-        cv2.putText(frame, "Range: 0.00 m", (10, 48),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, GRAY, 1)
-        return frame
-
-    elapsed = time.time() - data['last_frame'] if data['last_frame'] else float('inf')
-    status = "LIVE" if elapsed < 2.0 else "STALE"
-    target = "TGT" if data.get('target_present') else "---"
-
-    cv2.putText(frame, f"RADAR {status} [{target}]", (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                GREEN if status == "LIVE" else RED, 1)
-    cv2.putText(frame, f"Range: {data['distance_m']:.2f} m", (10, 48),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                GREEN if data['distance_m'] < 5 else
-                YELLOW if data['distance_m'] < 15 else RED, 1)
-    return frame
-
-
-def draw_spectrum_bar(frame, spectrum):
+def draw_radar_scope(frame, tracked, sweep_angle):
+    """Draw a radar-style circular scope with drone blips from camera data."""
     h, w = frame.shape[:2]
-    bar_h = 50
-    bar_y0 = h - bar_h - 5
+    radius = 70
+    cx, cy = w - radius - 15, 85 + radius  # below HUD panel
 
+    # Dark background circle
     overlay = frame.copy()
-    cv2.rectangle(overlay, (5, bar_y0 - 15), (w - 5, h - 2), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+    cv2.circle(overlay, (cx, cy), radius + 4, (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
 
-    cv2.putText(frame, "FMCW Spectrum", (10, bar_y0 - 3),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, CYAN, 1)
+    # Range rings
+    for r_frac in (0.33, 0.66, 1.0):
+        r = int(radius * r_frac)
+        cv2.circle(frame, (cx, cy), r, (0, 60, 0), 1)
 
-    bin_w = max(1, (w - 20) // SPECTRAL_BINS)
-    for i in range(SPECTRAL_BINS):
-        val = float(spectrum[i])
-        bh = int((val / MAX_SPECTRAL_VAL) * bar_h)
-        if bh < 1:
+    # Crosshairs
+    cv2.line(frame, (cx - radius, cy), (cx + radius, cy), (0, 60, 0), 1)
+    cv2.line(frame, (cx, cy - radius), (cx, cy + radius), (0, 60, 0), 1)
+
+    # Sweep line (rotating)
+    sweep_x = int(cx + radius * np.cos(sweep_angle))
+    sweep_y = int(cy - radius * np.sin(sweep_angle))
+    cv2.line(frame, (cx, cy), (sweep_x, sweep_y), (0, 180, 0), 1)
+
+    # Sweep fade trail
+    for i in range(1, 4):
+        a = sweep_angle - i * 0.15
+        sx = int(cx + radius * np.cos(a))
+        sy = int(cy - radius * np.sin(a))
+        intensity = max(0, 180 - i * 50)
+        cv2.line(frame, (cx, cy), (sx, sy), (0, intensity, 0), 1)
+
+    # Label
+    cv2.putText(frame, "SCOPE", (cx - 22, cy - radius - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, GREEN, 1)
+
+    # Range labels
+    cv2.putText(frame, "10m", (cx + int(radius * 0.33) - 8, cy - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.2, (0, 80, 0), 1)
+    cv2.putText(frame, "20m", (cx + int(radius * 0.66) - 8, cy - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.2, (0, 80, 0), 1)
+
+    # Plot drone blips
+    for oid, obj in tracked.items():
+        obj_cx, obj_cy, obj_w, obj_h, score, depth_m, source = obj
+        if score < DRONE_THRESHOLD:
             continue
-        x = 10 + i * bin_w
-        ratio = min(val / MAX_SPECTRAL_VAL, 1.0)
-        color = (0, int(255 * (1 - ratio)), int(255 * ratio))
-        cv2.rectangle(frame, (x, bar_y0 + bar_h - bh),
-                      (x + bin_w - 1, bar_y0 + bar_h), color, -1)
+
+        # Map camera X position to radar angle (left=-90°, center=0°, right=+90°)
+        # Horizontal position relative to frame center
+        norm_x = (obj_cx - MAIN_W / 2) / (MAIN_W / 2)  # -1 to +1
+
+        # Map depth to distance from radar center (0m=center, 20m=edge)
+        max_range = 20.0
+        d = min(depth_m, max_range) / max_range if depth_m > 0 else 0.8
+        dist_px = int(d * radius)
+
+        # Convert to radar XY: X maps to horizontal, depth maps to vertical (up=far)
+        blip_x = cx + int(norm_x * dist_px)
+        blip_y = cy - dist_px  # up = further away
+
+        # Blip
+        cv2.circle(frame, (blip_x, blip_y), 4, (0, 255, 0), -1)
+        cv2.circle(frame, (blip_x, blip_y), 7, (0, 200, 0), 1)
+
+        # Distance label
+        if depth_m > 0:
+            cv2.putText(frame, f"{depth_m:.0f}m",
+                        (blip_x + 8, blip_y + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.25, GREEN, 1)
+
+    # Outer ring
+    cv2.circle(frame, (cx, cy), radius, GREEN, 1)
+
     return frame
-
-
-def draw_radar_table(panel, radar_data, radar_detected=False, radar_conf=0.0,
-                     radar_info=""):
-    """Draw a compact radar values table on the depth side-panel."""
-    h, w = panel.shape[:2]
-
-    if radar_data is None or radar_data.get('mode') is None:
-        cv2.putText(panel, "RADAR: N/A", (5, h - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, GRAY, 1)
-        return panel
-
-    spectrum = radar_data['spectrum']
-    dist_cm = radar_data['distance_cm']
-    dist_m = radar_data['distance_m']
-    mode = radar_data['mode']
-    frames = radar_data['frames']
-    target = radar_data.get('target_present', False)
-    elapsed = time.time() - radar_data['last_frame'] if radar_data['last_frame'] else float('inf')
-
-    peak_bin = int(np.argmax(spectrum)) if np.any(spectrum > 0) else 0
-    peak_amp = float(spectrum[peak_bin]) if np.any(spectrum > 0) else 0.0
-    noise_floor = 1.5
-    active_bins = int(np.sum(spectrum > noise_floor))
-    active_ratio = active_bins / SPECTRAL_BINS
-    mean_amp = float(np.mean(spectrum[spectrum > 0])) if np.any(spectrum > 0) else 0.0
-
-    # Spectral spread
-    if np.any(spectrum > noise_floor):
-        active_indices = np.where(spectrum > noise_floor)[0]
-        spectral_spread = int(active_indices[-1] - active_indices[0]) if len(active_indices) > 1 else 0
-    else:
-        spectral_spread = 0
-
-    # Table background
-    table_h = 225
-    table_y = h - table_h - 5
-    overlay = panel.copy()
-    cv2.rectangle(overlay, (3, table_y), (w - 3, h - 3), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.7, panel, 0.3, 0, panel)
-
-    # Header
-    status_str = "LIVE" if elapsed < 2.0 else "STALE"
-    status_clr = GREEN if elapsed < 2.0 else RED
-    cv2.putText(panel, "RADAR OUTPUT", (8, table_y + 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, CYAN, 1)
-    cv2.putText(panel, status_str, (w - 45, table_y + 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.30, status_clr, 1)
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    fs = 0.30
-    lh = 14  # line height
-    x_lbl = 8
-    x_val = 90
-    y = table_y + 30
-
-    rows = [
-        ("Mode",      f"{'B (d+spec)' if mode == 'B' else 'A (dist)' if mode == 'A' else '?'}"),
-        ("Target",    f"{'YES' if target else 'NO'}"),
-        ("Distance",  f"{dist_cm} cm  ({dist_m:.2f} m)"),
-        ("Frames",    f"{frames}"),
-        ("Peak Bin",  f"{peak_bin}"),
-        ("Peak Amp",  f"{peak_amp:.1f} / {MAX_SPECTRAL_VAL}"),
-        ("Active",    f"{active_bins} / {SPECTRAL_BINS} bins"),
-        ("Active %",  f"{active_ratio:.0%}"),
-        ("Spread",    f"{spectral_spread} bins"),
-        ("Mean Amp",  f"{mean_amp:.1f}"),
-    ]
-
-    for label, value in rows:
-        cv2.putText(panel, label, (x_lbl, y), font, fs, GRAY, 1)
-        val_clr = WHITE
-        if label == "Target":
-            val_clr = GREEN if target else GRAY
-        elif label == "Distance":
-            val_clr = GREEN if dist_m < 5 else YELLOW if dist_m < 15 else RED
-        cv2.putText(panel, value, (x_val, y), font, fs, val_clr, 1)
-        y += lh
-
-    # --- Drone analysis section ---
-    y += 4
-    cv2.line(panel, (x_lbl, y), (w - 10, y), (80, 80, 80), 1)
-    y += 12
-    cv2.putText(panel, "DRONE ANALYSIS", (x_lbl, y), font, 0.35, MAGENTA, 1)
-    y += lh
-
-    drone_label = "DETECTED" if radar_detected else "---"
-    drone_clr = RED if radar_detected else GRAY
-    cv2.putText(panel, "uDoppler", (x_lbl, y), font, fs, GRAY, 1)
-    cv2.putText(panel, drone_label, (x_val, y), font, fs, drone_clr, 1)
-    y += lh
-
-    conf_pct = f"{radar_conf:.0%}"
-    conf_clr = RED if radar_conf >= 0.5 else ORANGE if radar_conf >= 0.25 else GREEN
-    cv2.putText(panel, "Drone Conf", (x_lbl, y), font, fs, GRAY, 1)
-    cv2.putText(panel, conf_pct, (x_val, y), font, fs, conf_clr, 1)
-    y += lh
-
-    # Confidence bar
-    bar_w = w - x_lbl - 15
-    cv2.rectangle(panel, (x_lbl, y), (x_lbl + bar_w, y + 8), (50, 50, 50), -1)
-    fill_w = int(bar_w * radar_conf)
-    cv2.rectangle(panel, (x_lbl, y), (x_lbl + fill_w, y + 8), conf_clr, -1)
-    # Threshold marker
-    thresh_x = x_lbl + int(bar_w * DRONE_THRESHOLD)
-    cv2.line(panel, (thresh_x, y - 2), (thresh_x, y + 10), WHITE, 1)
-
-    return panel
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +404,7 @@ def build_oak_pipeline():
     # Detection parser (host-side, avoids device crash)
     parser = pipeline.create(dai.node.DetectionParser)
     parser.setNNArchive(dai.NNArchive(str(ARCHIVE_PATH)))
-    parser.setConfidenceThreshold(0.25)
+    parser.setConfidenceThreshold(0.15)
     parser.setInputImageSize(NN_W, NN_H)
     parser.setRunOnHost(True)
     nn.out.link(parser.input)
@@ -682,16 +464,16 @@ def main():
         labels = load_coco_labels()
         print(f"Loaded {len(labels)} COCO class labels")
 
-    # --- Initialize radar ---
+    # --- Radar disabled ---
     radar = None
-    if not args.no_radar:
-        try:
-            radar = RadarReader(args.port, args.baud)
-            radar.connect()
-            radar.start()
-            print(f"Radar connected on {args.port}")
-        except Exception as e:
-            print(f"Radar unavailable: {e} — continuing camera-only")
+    # if not args.no_radar:
+    #     try:
+    #         radar = RadarReader(args.port, args.baud)
+    #         radar.connect()
+    #         radar.start()
+    #         print(f"Radar connected on {args.port}")
+    #     except Exception as e:
+    #         print(f"Radar unavailable: {e} — continuing camera-only")
 
     # --- Initialize OAK camera + YOLO ---
     pipeline = rgbQ = depthQ = detQ = None
@@ -719,14 +501,12 @@ def main():
                     print(f"Fallback also failed: {e2}")
                     pipeline = None
 
-    if radar is None and pipeline is None:
-        print("ERROR: Neither radar nor camera available.")
+    if pipeline is None:
+        print("ERROR: Camera not available.")
         sys.exit(1)
 
     # --- Detection components ---
-    depth_searcher = DepthRangeSearcher()
-    radar_analyzer = RadarDroneAnalyzer()
-    tracker = CentroidTracker(max_disappeared=20)
+    tracker = DroneTracker()
     scorer = DroneScorer()
 
     cv2.namedWindow("Drone Detector", cv2.WINDOW_NORMAL)
@@ -738,6 +518,7 @@ def main():
     last_rgb_frame = None
     last_depth_frame = None
 
+    sweep_angle = 0.0
     print(f"Drone detector running — press 'q' to quit")
 
     try:
@@ -765,25 +546,32 @@ def main():
                 except Exception:
                     pass
 
-            # --- Radar ---
-            radar_data = radar.get_data() if radar else None
-            radar_detected, radar_conf, radar_info = radar_analyzer.analyze(radar_data)
-
-            # --- Build detection candidates ---
+            # --- Build detection candidates (camera only) ---
             # Each candidate: (cx, cy, w, h, drone_score, depth_m, source_str)
             detections = []
-            detection_mode = "IDLE"
+            detection_mode = "CAMERA"
             nn_det_count = len(yolo_detections)
 
-            target_present = (radar_data is not None
-                              and radar_data.get('target_present', False))
             has_depth = depth_frame is not None
             has_rgb = rgb_frame is not None
 
-            # --- Process YOLO detections ---
+            def get_depth_at(cx, cy, w, h):
+                """Get median depth at a detection center."""
+                if not has_depth:
+                    return 0.0
+                r = max(5, min(w, h) // 4)
+                dy = np.clip(cy, r, depth_frame.shape[0] - r - 1)
+                dx = np.clip(cx, r, depth_frame.shape[1] - r - 1)
+                region = depth_frame[dy-r:dy+r+1, dx-r:dx+r+1]
+                valid = region[region > 0]
+                return float(np.median(valid)) / 1000.0 if len(valid) > 0 else 0.0
+
+            # --- YOLO detections — only flying objects pass ---
             if has_rgb and yolo_detections:
+                gray_frame = cv2.cvtColor(
+                    cv2.resize(rgb_frame, (MAIN_W, MAIN_H)),
+                    cv2.COLOR_BGR2GRAY)
                 for det in yolo_detections:
-                    # Scale YOLO bbox (normalized 0-1) to frame coordinates
                     cx = int((det.xmin + det.xmax) / 2 * MAIN_W)
                     cy = int((det.ymin + det.ymax) / 2 * MAIN_H)
                     w = int((det.xmax - det.xmin) * MAIN_W)
@@ -791,75 +579,50 @@ def main():
                     yolo_label = det.label
                     yolo_conf = det.confidence
 
-                    # Get depth at detection center
-                    det_depth_m = 0.0
-                    if has_depth:
-                        r = max(5, min(w, h) // 4)
-                        dy = np.clip(cy, r, depth_frame.shape[0] - r - 1)
-                        dx = np.clip(cx, r, depth_frame.shape[1] - r - 1)
-                        region = depth_frame[dy-r:dy+r+1, dx-r:dx+r+1]
-                        valid = region[region > 0]
-                        if len(valid) > 0:
-                            det_depth_m = float(np.median(valid)) / 1000.0
-
-                    # Score this detection
                     drone_score, reason = scorer.score(
-                        yolo_label, yolo_conf, det_depth_m,
-                        radar_data, radar_conf, radar_detected)
+                        yolo_label, yolo_conf, 0.0)
+                    if drone_score == 0.0:
+                        continue
 
+                    # Reject bright light sources — not drones
+                    # Small center patch so glow doesn't dilute the check
+                    r = max(3, min(w, h) // 6)
+                    ry = np.clip(cy, r, gray_frame.shape[0] - r - 1)
+                    rx = np.clip(cx, r, gray_frame.shape[1] - r - 1)
+                    patch = gray_frame[ry-r:ry+r+1, rx-r:rx+r+1]
+                    if patch.size > 0:
+                        mean_val = float(np.mean(patch))
+                        bright_ratio = np.sum(patch > 200) / patch.size
+                        if mean_val > 200 or bright_ratio > 0.3:
+                            continue
+
+                    det_depth_m = get_depth_at(cx, cy, w, h)
                     lbl_name = labels[yolo_label] if yolo_label < len(labels) else "?"
-                    source = f"Y:{lbl_name}"
-
                     detections.append((cx, cy, w, h, drone_score,
-                                       det_depth_m, source))
+                                       det_depth_m, f"Y:{lbl_name}"))
+                detection_mode = "YOLO"
 
-                detection_mode = "YOLO+RADAR" if target_present else "YOLO"
+            # --- Update tracker (multi-frame confirm + KCF lock-on) ---
+            display_frame = (cv2.resize(rgb_frame, (MAIN_W, MAIN_H))
+                             if has_rgb else
+                             np.zeros((MAIN_H, MAIN_W, 3), dtype=np.uint8))
+            tracked = tracker.update(display_frame, detections)
 
-            # --- Radar-guided depth search for objects YOLO missed ---
-            if target_present and has_depth:
-                radar_dist = radar_data['distance_m']
-                recent = radar_data.get('recent_distances', [])
-                depth_candidates = (
-                    depth_searcher.search_multi(depth_frame, recent)
-                    if recent else
-                    depth_searcher.search(depth_frame, radar_dist))
-
-                # Only add depth candidates that don't overlap with YOLO detections
-                for cx, cy, w, h, median_depth_m in depth_candidates:
-                    overlaps_yolo = False
-                    for yd in detections:
-                        dx = abs(cx - yd[0])
-                        dy = abs(cy - yd[1])
-                        if dx < max(w, yd[2]) and dy < max(h, yd[3]):
-                            overlaps_yolo = True
-                            break
-
-                    if not overlaps_yolo:
-                        # No YOLO match — score based on radar + depth
-                        drone_score, reason = scorer.score(
-                            None, 0.0, median_depth_m,
-                            radar_data, radar_conf, radar_detected)
-                        detections.append((cx, cy, w, h, drone_score,
-                                           median_depth_m, f"R+D"))
-                        if detection_mode == "YOLO":
-                            detection_mode = "YOLO+RADAR"
-                        elif detection_mode == "IDLE":
-                            detection_mode = "RADAR+DEPTH"
-
-            # --- Radar-only (no camera) ---
-            elif target_present and not has_rgb:
-                detection_mode = "RADAR ONLY"
-
-            # --- Update tracker ---
-            tracked = tracker.update(detections)
-
-            # --- Display ---
+            # --- Display (CLAHE for low-light enhancement) ---
             if has_rgb:
-                main_panel = cv2.resize(rgb_frame, (MAIN_W, MAIN_H))
+                main_panel = display_frame.copy()
                 if main_panel.ndim == 2:
                     main_panel = cv2.cvtColor(main_panel, cv2.COLOR_GRAY2BGR)
                 elif main_panel.shape[2] == 4:
                     main_panel = cv2.cvtColor(main_panel, cv2.COLOR_BGRA2BGR)
+                # Auto-enhance in low light
+                gray_check = cv2.cvtColor(main_panel, cv2.COLOR_BGR2GRAY)
+                if np.mean(gray_check) < 80:
+                    lab = cv2.cvtColor(main_panel, cv2.COLOR_BGR2LAB)
+                    l, a, b = cv2.split(lab)
+                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                    l = clahe.apply(l)
+                    main_panel = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
             else:
                 main_panel = np.zeros((MAIN_H, MAIN_W, 3), dtype=np.uint8)
                 cv2.putText(main_panel, "NO CAMERA", (200, 240),
@@ -867,21 +630,13 @@ def main():
 
             main_panel = draw_drone_boxes(main_panel, tracked)
 
-            if detection_mode == "RADAR ONLY" and radar_data:
-                cv2.putText(main_panel,
-                            f"RADAR TARGET: {radar_data['distance_m']:.1f}m",
-                            (MAIN_W // 2 - 130, MAIN_H // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, ORANGE, 2)
-
             num_drones = sum(1 for d in tracked.values()
                              if d[4] >= DRONE_THRESHOLD)
-            main_panel = draw_hud(main_panel, num_drones, radar_data,
-                                  radar_detected, radar_conf, radar_info,
+            main_panel = draw_hud(main_panel, num_drones,
                                   detection_mode, nn_det_count)
 
-            main_panel = draw_radar_hud(main_panel, radar_data)
-            if radar_data is not None and radar_data.get('mode') is not None:
-                main_panel = draw_spectrum_bar(main_panel, radar_data['spectrum'])
+            sweep_angle += 0.08
+            main_panel = draw_radar_scope(main_panel, tracked, sweep_angle)
 
             if has_depth:
                 depth_clipped = np.clip(depth_frame, 0, 15000).astype(np.float32)
@@ -901,26 +656,6 @@ def main():
                 cv2.putText(depth_panel, "NO DEPTH", (40, 240),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, RED, 1)
 
-            # Live radar distance readout at top of side panel
-            if radar_data is not None and radar_data.get('mode') is not None:
-                dist_m = radar_data['distance_m']
-                tgt = radar_data.get('target_present', False)
-                overlay = depth_panel.copy()
-                cv2.rectangle(overlay, (3, 30), (DEPTH_W - 3, 80), (0, 0, 0), -1)
-                cv2.addWeighted(overlay, 0.7, depth_panel, 0.3, 0, depth_panel)
-                cv2.putText(depth_panel, "RADAR DIST", (8, 46),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, CYAN, 1)
-                dist_clr = GREEN if dist_m < 5 else YELLOW if dist_m < 15 else RED
-                if not tgt:
-                    dist_clr = GRAY
-                cv2.putText(depth_panel, f"{dist_m:.2f} m",
-                            (8, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.8, dist_clr, 2)
-
-            # Radar values table on depth side-panel
-            depth_panel = draw_radar_table(depth_panel, radar_data,
-                                           radar_detected, radar_conf,
-                                           radar_info)
-
             canvas = np.hstack([main_panel, depth_panel])
 
             fps_count += 1
@@ -939,8 +674,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        if radar:
-            radar.stop()
+        # if radar:
+        #     radar.stop()
         if pipeline:
             pipeline.stop()
         cv2.destroyAllWindows()
