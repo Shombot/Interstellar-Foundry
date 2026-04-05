@@ -1,0 +1,54 @@
+# System/config files
+.bash_history
+.bash_logout
+.bashrc
+.profile
+.xsessionrc
+.sudo_as_admin_successful
+
+# Caches and package managers
+.cache/
+.npm/
+.npm-global/
+.npmrc
+.dotnet/
+__pycache__/
+.depthai_cache/
+.depthai_cached_models/
+.depthai_sdk/
+
+# App/editor config
+.claude/
+.claude.json
+.config/
+.vscode/
+.gnupg/
+.pki/
+.ssh/
+.local/
+.ros/
+snap/
+
+# Default OS folders
+Desktop/
+Documents/
+Downloads/
+Music/
+Pictures/
+Public/
+Templates/
+Videos/
+
+# Build artifacts and logs
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+log/
+
+# Large model archives
+yolov6n_coco_rvc2.tar.xz
+
+# Separate git repos (cloned from upstream)
+depthai/
+depthai-python/
+ros2_ws/src/depthai-ros/
