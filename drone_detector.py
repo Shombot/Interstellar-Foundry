@@ -37,14 +37,18 @@ import sys
 import os
 import time
 import json
+from collections import namedtuple
 from pathlib import Path
 
 import numpy as np
 import cv2
 
-sys.path.insert(0, os.path.expanduser("~"))
-from doppler_reader import DopplerReader
-from kalman_fusion import MultiDroneTracker, FusedTrack
+# Hardware imports — only needed when not in video mode
+# (guarded in main() so --video works without depthai/doppler installed)
+
+
+# Simple detection object matching depthai's format for video mode
+VideoDet = namedtuple('VideoDet', ['xmin', 'ymin', 'xmax', 'ymax', 'label', 'confidence'])
 
 # Layout
 MAIN_W, MAIN_H = 640, 480
@@ -67,19 +71,82 @@ DARK_GREEN = (0, 100, 0)
 DRONE_THRESHOLD = 0.30
 
 # COCO classes that are airborne / could be a drone
-FLYING_CLASSES = {4, 14, 29, 33}  # airplane, bird, frisbee, kite
+# 80 = drone (available after fine-tuning, see training/)
+FLYING_CLASSES = {4, 14, 29, 33, 80}  # airplane, bird, frisbee, kite, drone
 
 # Model paths
 SCRIPT_DIR = Path(__file__).parent
-BLOB_PATH = SCRIPT_DIR / "yolov6n_model" / "yolov6n-r2-288x512_openvino_2022.1_6shave.blob"
+BLOB_PATH_V8 = SCRIPT_DIR / "yolov6n_model" / "best_openvino_2022.1_6shave.blob"
+BLOB_PATH_V6 = SCRIPT_DIR / "yolov6n_model" / "yolov6n-r2-288x512_openvino_2022.1_6shave.blob"
+BLOB_PATH = BLOB_PATH_V8 if BLOB_PATH_V8.exists() else BLOB_PATH_V6
 ARCHIVE_PATH = SCRIPT_DIR / "yolov6n_coco_rvc2.tar.xz"
 CONFIG_PATH = SCRIPT_DIR / "yolov6n_model" / "config.json"
+USE_V8 = BLOB_PATH == BLOB_PATH_V8
+
+
+NUM_CLASSES = 81 if USE_V8 else 80
+CONF_THRESHOLD = 0.50
+IOU_THRESHOLD = 0.45
 
 
 def load_coco_labels():
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
-    return cfg['model']['heads'][0]['metadata']['classes']
+    labels = cfg['model']['heads'][0]['metadata']['classes']
+    if USE_V8 and len(labels) < 81:
+        labels.append("drone")
+    return labels
+
+
+def parse_yolov8_raw(nn_data):
+    """Parse raw YOLOv8 NN output into a list of detection dicts.
+    YOLOv8 output shape: (1, 85, N) where 85 = 4 bbox + 81 class scores.
+    Returns list of dicts with keys: xmin, ymin, xmax, ymax, confidence, label.
+    """
+    output = np.array(nn_data.getFirstLayerFp16()).reshape(NUM_CLASSES + 4, -1).T
+    boxes = output[:, :4]
+    scores = output[:, 4:]
+
+    class_ids = np.argmax(scores, axis=1)
+    confidences = scores[np.arange(len(scores)), class_ids]
+
+    mask = confidences > CONF_THRESHOLD
+    boxes = boxes[mask]
+    confidences = confidences[mask]
+    class_ids = class_ids[mask]
+
+    if len(boxes) == 0:
+        return []
+
+    # xywh to xyxy (normalized by NN input size)
+    x, y, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    x1 = (x - w / 2) / NN_W
+    y1 = (y - h / 2) / NN_H
+    x2 = (x + w / 2) / NN_W
+    y2 = (y + h / 2) / NN_H
+
+    # NMS
+    indices = cv2.dnn.NMSBoxes(
+        bboxes=list(zip(x1, y1, x2 - x1, y2 - y1)),
+        scores=confidences.tolist(),
+        score_threshold=CONF_THRESHOLD,
+        nms_threshold=IOU_THRESHOLD,
+    )
+    if len(indices) == 0:
+        return []
+
+    detections = []
+    for i in indices.flatten():
+        det = argparse.Namespace(
+            xmin=float(np.clip(x1[i], 0, 1)),
+            ymin=float(np.clip(y1[i], 0, 1)),
+            xmax=float(np.clip(x2[i], 0, 1)),
+            ymax=float(np.clip(y2[i], 0, 1)),
+            confidence=float(confidences[i]),
+            label=int(class_ids[i]),
+        )
+        detections.append(det)
+    return detections
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +154,9 @@ def load_coco_labels():
 # ---------------------------------------------------------------------------
 class DroneScorer:
     def score(self, yolo_label, yolo_conf, depth_m):
+        # Direct drone class (available after fine-tuning)
+        if yolo_label == 80:
+            return min(0.95, 0.7 + yolo_conf * 0.25), f"drone {yolo_conf:.0%}"
         if yolo_label is not None and yolo_label not in FLYING_CLASSES:
             return 0.0, "ground-obj"
         if yolo_label == 14:
@@ -179,7 +249,10 @@ def draw_camera_yolo_boxes(frame, yolo_detections, labels, depth_frame,
         x2, y2 = cx + w // 2, cy + h // 2
 
         lbl_idx = det.label
-        lbl_name = labels[lbl_idx] if lbl_idx < len(labels) else "?"
+        if isinstance(labels, dict):
+            lbl_name = labels.get(lbl_idx, "?")
+        else:
+            lbl_name = labels[lbl_idx] if lbl_idx < len(labels) else "?"
         conf = det.confidence
 
         in_flying = lbl_idx in FLYING_CLASSES
@@ -480,16 +553,23 @@ def build_oak_pipeline():
     nn.setNumInferenceThreads(2)
     manip.out.link(nn.input)
 
-    parser = pipeline.create(dai.node.DetectionParser)
-    parser.setNNArchive(dai.NNArchive(str(ARCHIVE_PATH)))
-    parser.setConfidenceThreshold(0.15)
-    parser.setInputImageSize(NN_W, NN_H)
-    parser.setRunOnHost(True)
-    nn.out.link(parser.input)
-
     rgbQ = rgbOut.createOutputQueue(maxSize=1, blocking=False)
     depthQ = stereo.depth.createOutputQueue(maxSize=1, blocking=False)
-    detQ = parser.out.createOutputQueue(maxSize=1, blocking=False)
+
+    if USE_V8:
+        # YOLOv8 — raw NN output, parse on host
+        nnQ = nn.out.createOutputQueue(maxSize=1, blocking=False)
+        return pipeline, rgbQ, depthQ, nnQ
+    else:
+        # YOLOv6 — use DetectionParser with NNArchive
+        parser = pipeline.create(dai.node.DetectionParser)
+        parser.setNNArchive(dai.NNArchive(str(ARCHIVE_PATH)))
+        parser.setConfidenceThreshold(0.15)
+        parser.setInputImageSize(NN_W, NN_H)
+        parser.setRunOnHost(True)
+        nn.out.link(parser.input)
+        detQ = parser.out.createOutputQueue(maxSize=1, blocking=False)
+        return pipeline, rgbQ, depthQ, detQ
 
     return pipeline, rgbQ, depthQ, detQ
 
@@ -533,56 +613,106 @@ def main():
     parser.add_argument('--no-camera', action='store_true', help='Disable OAK camera')
     parser.add_argument('--doppler-pin', type=int, default=105,
                         help='GPIO line for Doppler sensor (default: 105 = Pin 29)')
+    parser.add_argument('--video', type=str, default=None,
+                        help='Path to video file — runs YOLO on CPU, no hardware needed')
     args = parser.parse_args()
+
+    video_mode = args.video is not None
+
+    # --- Video mode: load YOLO via ultralytics + open video file ---
+    video_cap = None
+    yolo_model = None
+    if video_mode:
+        if not os.path.isfile(args.video):
+            print(f"ERROR: Video file not found: {args.video}")
+            sys.exit(1)
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            print("ERROR: ultralytics not installed. Run: pip3 install ultralytics")
+            sys.exit(1)
+        video_cap = cv2.VideoCapture(args.video)
+        if not video_cap.isOpened():
+            print(f"ERROR: Cannot open video: {args.video}")
+            sys.exit(1)
+        video_fps = video_cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        print(f"Video: {args.video} ({total_frames} frames @ {video_fps:.0f}fps)")
+        # Prefer fine-tuned model (drone class), fall back to stock COCO
+        FINETUNED_PT = SCRIPT_DIR / "training" / "runs" / "drone_phase2" / "weights" / "best.pt"
+        DOWNLOADED_PT = Path("/Users/rasho/Downloads/best.pt")
+        if FINETUNED_PT.exists():
+            yolo_model = YOLO(str(FINETUNED_PT))
+            print(f"YOLOv8n (drone-finetuned) loaded for CPU inference")
+        elif DOWNLOADED_PT.exists():
+            yolo_model = YOLO(str(DOWNLOADED_PT))
+            print(f"YOLOv8n (drone-finetuned) loaded for CPU inference")
+        else:
+            yolo_model = YOLO("yolov8n.pt")
+            print("WARNING: Fine-tuned model not found, using stock YOLOv8n (no drone class)")
 
     # --- Load COCO labels ---
     labels = []
-    if CONFIG_PATH.exists():
+    if video_mode:
+        # YOLOv8n uses standard COCO names — load from the model
+        labels = yolo_model.names  # dict {0: 'person', 1: 'bicycle', ...}
+    elif CONFIG_PATH.exists():
         labels = load_coco_labels()
         print(f"Loaded {len(labels)} COCO class labels")
 
-    # --- Initialize CQRobot Doppler Sensor ---
+    # --- Initialize hardware sensors (skip in video mode) ---
     doppler = None
-    if not args.no_doppler:
-        try:
-            doppler = DopplerReader(line=args.doppler_pin)
-            doppler.start()
-            print(f"CQRobot 10.525GHz Doppler sensor started (GPIO line {args.doppler_pin})")
-        except Exception as e:
-            print(f"Doppler sensor unavailable: {e} -- continuing without Doppler")
-
-    # --- Initialize OAK camera + YOLO ---
     pipeline = rgbQ = depthQ = detQ = None
     has_nn = False
-    if not args.no_camera:
-        try:
-            if BLOB_PATH.exists() and ARCHIVE_PATH.exists():
-                pipeline, rgbQ, depthQ, detQ = build_oak_pipeline()
-                has_nn = True
-                print("OAK camera + YOLOv6n on Myriad X VPU")
-            else:
-                pipeline, rgbQ, depthQ, detQ = build_oak_pipeline_no_nn()
-                print("OAK camera (no YOLO blob -- depth-only mode)")
-            pipeline.start()
-        except Exception as e:
-            print(f"OAK camera error: {e}")
-            if has_nn:
-                try:
-                    pipeline, rgbQ, depthQ, detQ = build_oak_pipeline_no_nn()
-                    pipeline.start()
-                    has_nn = False
-                    print("Fell back to depth-only pipeline")
-                except Exception as e2:
-                    print(f"Fallback also failed: {e2}")
-                    pipeline = None
 
-    if pipeline is None and doppler is None:
-        print("ERROR: No sensors available.")
-        sys.exit(1)
+    if not video_mode:
+        # Import hardware modules only when needed
+        sys.path.insert(0, os.path.expanduser("~"))
+        from doppler_reader import DopplerReader
+
+        if not args.no_doppler:
+            try:
+                doppler = DopplerReader(line=args.doppler_pin)
+                doppler.start()
+                print(f"CQRobot 10.525GHz Doppler sensor started (GPIO line {args.doppler_pin})")
+            except Exception as e:
+                print(f"Doppler sensor unavailable: {e} -- continuing without Doppler")
+
+        if not args.no_camera:
+            try:
+                if USE_V8 and BLOB_PATH.exists():
+                    pipeline, rgbQ, depthQ, detQ = build_oak_pipeline()
+                    has_nn = True
+                    print("OAK camera + YOLOv8n (drone-finetuned) on Myriad X VPU")
+                elif BLOB_PATH.exists() and ARCHIVE_PATH.exists():
+                    pipeline, rgbQ, depthQ, detQ = build_oak_pipeline()
+                    has_nn = True
+                    print("OAK camera + YOLOv6n on Myriad X VPU")
+                else:
+                    pipeline, rgbQ, depthQ, detQ = build_oak_pipeline_no_nn()
+                    print("OAK camera (no YOLO blob -- depth-only mode)")
+                pipeline.start()
+            except Exception as e:
+                print(f"OAK camera error: {e}")
+                if has_nn:
+                    try:
+                        pipeline, rgbQ, depthQ, detQ = build_oak_pipeline_no_nn()
+                        pipeline.start()
+                        has_nn = False
+                        print("Fell back to depth-only pipeline")
+                    except Exception as e2:
+                        print(f"Fallback also failed: {e2}")
+                        pipeline = None
+
+        if pipeline is None and doppler is None:
+            print("ERROR: No sensors available.")
+            sys.exit(1)
 
     # --- Kalman fusion tracker ---
+    from kalman_fusion import MultiDroneTracker
     scorer = DroneScorer()
-    fusion_tracker = MultiDroneTracker(dt=1.0/30.0, confirm_frames=5)
+    dt = 1.0 / (video_fps if video_mode else 30.0)
+    fusion_tracker = MultiDroneTracker(dt=dt, confirm_frames=5)
 
     cv2.namedWindow("Drone Detector", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Drone Detector", CANVAS_W, CANVAS_H)
@@ -594,41 +724,72 @@ def main():
     last_depth_frame = None
     sweep_angle = 0.0
 
+    mode_str = "VIDEO" if video_mode else "Camera + Doppler Kalman Fusion"
     print("=" * 60)
-    print("  Drone Detector — Camera + Doppler Kalman Fusion")
-    print(f"  Camera:  {'ON' if pipeline else 'OFF'}")
-    print(f"  Doppler: {'ON' if doppler else 'OFF'}")
+    print(f"  Drone Detector — {mode_str}")
+    if video_mode:
+        print(f"  Source:  {args.video}")
+        print(f"  YOLO:   YOLOv8n (CPU)")
+    else:
+        print(f"  Camera:  {'ON' if pipeline else 'OFF'}")
+        print(f"  Doppler: {'ON' if doppler else 'OFF'}")
     print("  Press 'q' to quit")
     print("=" * 60)
 
     try:
         while True:
-            # --- Camera frames ---
+            # --- Get frames + detections ---
             rgb_frame = depth_frame = None
             yolo_detections = []
-
-            if pipeline is not None:
-                try:
-                    rgb_msg = rgbQ.tryGet()
-                    depth_msg = depthQ.tryGet()
-                    if rgb_msg is not None:
-                        last_rgb_frame = rgb_msg.getCvFrame()
-                    if depth_msg is not None:
-                        last_depth_frame = depth_msg.getFrame()
-                    rgb_frame = last_rgb_frame
-                    depth_frame = last_depth_frame
-
-                    if detQ is not None:
-                        det_msg = detQ.tryGet()
-                        if det_msg is not None:
-                            yolo_detections = det_msg.detections
-                except Exception:
-                    pass
-
-            # --- Doppler data ---
             doppler_data = None
-            if doppler is not None:
-                doppler_data = doppler.get_data()
+
+            if video_mode:
+                ret, frame = video_cap.read()
+                if not ret:
+                    # Loop video
+                    video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = video_cap.read()
+                    if not ret:
+                        break
+                rgb_frame = cv2.resize(frame, (MAIN_W, MAIN_H))
+
+                # Run YOLO on CPU
+                results = yolo_model(rgb_frame, verbose=False, conf=CONF_THRESHOLD)
+                for box in results[0].boxes:
+                    x1n = float(box.xyxyn[0][0])
+                    y1n = float(box.xyxyn[0][1])
+                    x2n = float(box.xyxyn[0][2])
+                    y2n = float(box.xyxyn[0][3])
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    yolo_detections.append(VideoDet(x1n, y1n, x2n, y2n, cls, conf))
+
+            else:
+                # --- OAK-D camera ---
+                if pipeline is not None:
+                    try:
+                        rgb_msg = rgbQ.tryGet()
+                        depth_msg = depthQ.tryGet()
+                        if rgb_msg is not None:
+                            last_rgb_frame = rgb_msg.getCvFrame()
+                        if depth_msg is not None:
+                            last_depth_frame = depth_msg.getFrame()
+                        rgb_frame = last_rgb_frame
+                        depth_frame = last_depth_frame
+
+                        if detQ is not None:
+                            det_msg = detQ.tryGet()
+                            if det_msg is not None:
+                                if USE_V8:
+                                    yolo_detections = parse_yolov8_raw(det_msg)
+                                else:
+                                    yolo_detections = det_msg.detections
+                    except Exception:
+                        pass
+
+                # --- Doppler data ---
+                if doppler is not None:
+                    doppler_data = doppler.get_data()
 
             # --- Build camera detection candidates for Kalman filter ---
             camera_dets = []  # (x_m, depth_m, confidence, cx_px, cy_px, w_px, h_px, src)
@@ -684,7 +845,10 @@ def main():
                     x_norm = (cx - MAIN_W / 2) / (MAIN_W / 2)  # -1 to +1
                     x_m = x_norm * det_depth_m * np.tan(hfov_rad / 2) if det_depth_m > 0 else x_norm * 5.0
 
-                    lbl_name = labels[yolo_label] if yolo_label < len(labels) else "?"
+                    if isinstance(labels, dict):
+                        lbl_name = labels.get(yolo_label, "?")
+                    else:
+                        lbl_name = labels[yolo_label] if yolo_label < len(labels) else "?"
                     camera_dets.append((x_m, det_depth_m, drone_score,
                                         cx, cy, w, h, f"Y:{lbl_name}"))
 
@@ -795,12 +959,17 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREEN, 1)
 
             cv2.imshow("Drone Detector", canvas)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # In video mode, pace playback to ~video fps; press space to pause
+            wait_ms = max(1, int(1000 / video_fps)) if video_mode else 1
+            key = cv2.waitKey(wait_ms) & 0xFF
+            if key == ord('q'):
                 break
 
     except KeyboardInterrupt:
         pass
     finally:
+        if video_cap:
+            video_cap.release()
         if doppler:
             doppler.stop()
         if pipeline:

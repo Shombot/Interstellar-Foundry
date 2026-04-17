@@ -1,0 +1,12 @@
+names:
+- drone
+nc: 1
+roboflow:
+  license: Public Domain
+  project: drones-detection-with-yolov8
+  url: https://universe.roboflow.com/zhejiang-university-china-dliq1/drones-detection-with-yolov8/dataset/1
+  version: 1
+  workspace: zhejiang-university-china-dliq1
+test: ../test/images
+train: ../train/images
+val: ../valid/images
