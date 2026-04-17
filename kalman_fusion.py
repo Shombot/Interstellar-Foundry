@@ -44,6 +44,12 @@ class FusedTrack:
     # Source flags
     has_camera: bool = False
     has_doppler: bool = False
+    # Last-seen pixel bounding box — used to persist a lock on-screen
+    # when YOLO drops a frame. None until the first camera measurement.
+    last_cx: Optional[int] = None
+    last_cy: Optional[int] = None
+    last_w: Optional[int] = None
+    last_h: Optional[int] = None
 
 
 class DroneKalmanFilter:
@@ -75,6 +81,13 @@ class DroneKalmanFilter:
         self.camera_conf = 0.0
         self.doppler_conf = 0.0
         self.confirmed = False
+
+        # Last-seen pixel box, stamped by update_camera. Used by the renderer
+        # to keep a lock box visible when YOLO drops a frame.
+        self.last_cx = None
+        self.last_cy = None
+        self.last_w = None
+        self.last_h = None
 
         self._initialized = False
 
@@ -128,12 +141,22 @@ class DroneKalmanFilter:
         self.P = F @ self.P @ F.T + Q
         self.age += 1
 
-    def update_camera(self, x_m, depth_m, cam_confidence=0.5):
+    def update_camera(self, x_m, depth_m, cam_confidence=0.5,
+                      cx=None, cy=None, w=None, h=None):
         """
         Update with camera measurement: (x_offset_m, depth_m).
         x_m:     horizontal offset from camera center (metres)
         depth_m: stereo depth (metres)
+        cx, cy, w, h: optional pixel box of the detection — stored so the
+            renderer can keep drawing the lock box on YOLO-miss frames.
         """
+        # Stamp pixel box before anything else so first-frame init still
+        # captures it.
+        if cx is not None: self.last_cx = int(cx)
+        if cy is not None: self.last_cy = int(cy)
+        if w is not None:  self.last_w = int(w)
+        if h is not None:  self.last_h = int(h)
+
         if not self._initialized:
             self.initialize(x_m, depth_m)
             self.camera_conf = cam_confidence
@@ -192,7 +215,9 @@ class DroneKalmanFilter:
     def mark_missed(self):
         """No measurements this frame."""
         self.missed += 1
-        self.camera_conf *= 0.95
+        # Slow camera-confidence decay so short YOLO gaps (1–10 frames) do
+        # not break a lock; previously 0.95 per miss was too aggressive.
+        self.camera_conf *= 0.98
 
     def set_doppler(self, is_drone_sig, doppler_conf):
         """Update Doppler confidence (used in predict and overall confidence)."""
@@ -216,9 +241,10 @@ class DroneKalmanFilter:
         else:
             self.confidence = 0.0
 
-        # Decay with missed frames
+        # Decay with missed frames. Gentler than before (was 0.05/frame) so
+        # brief YOLO dropouts don't collapse the fused confidence.
         if self.missed > 0:
-            self.confidence *= max(0.1, 1.0 - self.missed * 0.05)
+            self.confidence *= max(0.1, 1.0 - self.missed * 0.02)
 
         # Boost when both sensors agree
         if self.camera_conf > 0.1 and self.doppler_conf > 0.1:
@@ -249,6 +275,10 @@ class DroneKalmanFilter:
             is_confirmed=self.confirmed,
             has_camera=self.camera_conf > 0.05,
             has_doppler=self.doppler_conf > 0.05,
+            last_cx=self.last_cx,
+            last_cy=self.last_cy,
+            last_w=self.last_w,
+            last_h=self.last_h,
         )
 
     def _kalman_update(self, z, H, R):
@@ -283,9 +313,11 @@ class MultiDroneTracker:
         """
         Update all tracks with new measurements.
 
-        camera_dets: list of (x_m, depth_m, cam_confidence)
-            x_m:      horizontal offset in metres from camera center
-            depth_m:  stereo depth in metres
+        camera_dets: list of tuples. Each tuple is either
+            (x_m, depth_m, cam_confidence)  OR
+            (x_m, depth_m, cam_confidence, cx_px, cy_px, w_px, h_px)
+            The pixel form lets the tracker remember the last-seen box so a
+            renderer can keep the lock visible when YOLO misses a frame.
         doppler_data: dict from DopplerReader.get_data() or None
         """
         # Doppler info
@@ -311,10 +343,18 @@ class MultiDroneTracker:
         self.predict_all(doppler_active,
                          doppler_data['activity_level'] if doppler_data else 0.0)
 
-        # Associate camera detections with existing tracks
+        def unpack(det):
+            """Return (x_m, depth_m, cam_conf, cx, cy, w, h)."""
+            if len(det) >= 7:
+                return det[0], det[1], det[2], det[3], det[4], det[5], det[6]
+            return det[0], det[1], det[2], None, None, None, None
+
+        # Associate camera detections with existing tracks. The gate widens
+        # with range because stereo-depth noise grows linearly with distance.
         used_det = set()
         for tid, kf in list(self.tracks.items()):
-            best_dist = 3.0  # max association distance in metres
+            est_depth = max(0.0, kf.x[1])
+            best_dist = 3.0 + 0.15 * est_depth
             best_idx = -1
             for i, det in enumerate(camera_dets):
                 if i in used_det:
@@ -327,10 +367,9 @@ class MultiDroneTracker:
                     best_idx = i
 
             if best_idx >= 0:
-                det = camera_dets[best_idx]
+                x_m, depth_m, cam_conf, cx, cy, w, h = unpack(camera_dets[best_idx])
                 used_det.add(best_idx)
-                x_m, depth_m, cam_conf = det[0], det[1], det[2]
-                kf.update_camera(x_m, depth_m, cam_conf)
+                kf.update_camera(x_m, depth_m, cam_conf, cx, cy, w, h)
                 # Apply Doppler radar range estimate
                 if has_doppler_range:
                     kf.update_doppler_range(doppler_range, doppler_range_conf)
@@ -348,10 +387,9 @@ class MultiDroneTracker:
         for i, det in enumerate(camera_dets):
             if i in used_det:
                 continue
-            x_m, depth_m, cam_conf = det[0], det[1], det[2]
+            x_m, depth_m, cam_conf, cx, cy, w, h = unpack(det)
             kf = DroneKalmanFilter(self.next_id, self.dt)
-            kf.initialize(x_m, depth_m)
-            kf.camera_conf = cam_conf
+            kf.update_camera(x_m, depth_m, cam_conf, cx, cy, w, h)
             if has_doppler_range:
                 kf.update_doppler_range(doppler_range, doppler_range_conf)
             kf.set_doppler(doppler_active, doppler_conf)
@@ -359,17 +397,19 @@ class MultiDroneTracker:
             self.tracks[self.next_id] = kf
             self.next_id += 1
 
-        # Prune dead tracks
+        # Prune dead tracks. Give unconfirmed candidates more runway (25 vs
+        # 10 previously) so a short YOLO dropout right after acquisition
+        # doesn't kill the track before it can confirm.
         for tid in list(self.tracks):
             kf = self.tracks[tid]
-            limit = self.max_missed if kf.confirmed else 10
+            limit = self.max_missed if kf.confirmed else 25
             if kf.missed > limit:
                 del self.tracks[tid]
 
-        # Build results
+        # Return every live track (confirmed + candidate). The renderer is
+        # responsible for visually distinguishing them — hiding candidates
+        # here caused visible flicker during the ~5-frame confirm window.
         results = {}
         for tid, kf in self.tracks.items():
-            ft = kf.get_fused_track()
-            if ft.is_confirmed or ft.age_frames < self.confirm_frames:
-                results[tid] = ft
+            results[tid] = kf.get_fused_track()
         return results

@@ -70,9 +70,28 @@ DARK_GREEN = (0, 100, 0)
 
 DRONE_THRESHOLD = 0.30
 
+# OAK-D RGB camera horizontal FOV (degrees). VFOV is derived from the frame
+# aspect ratio so both stay consistent if MAIN_W/MAIN_H change.
+CAMERA_HFOV_DEG = 70.0
+
 # COCO classes that are airborne / could be a drone
 # 80 = drone (available after fine-tuning, see training/)
 FLYING_CLASSES = {4, 14, 29, 33, 80}  # airplane, bird, frisbee, kite, drone
+
+
+def pixel_to_xyz(cx, cy, depth_m, hfov_deg=CAMERA_HFOV_DEG):
+    """Project a pixel + depth into camera-frame XYZ (meters).
+
+    Convention: X = right, Y = down, Z = forward. Origin at RGB camera center.
+    Returns (0, 0, 0) when depth is unknown.
+    """
+    if depth_m <= 0:
+        return 0.0, 0.0, 0.0
+    hfov = np.radians(hfov_deg)
+    vfov = 2 * np.arctan((MAIN_H / MAIN_W) * np.tan(hfov / 2))
+    x = ((cx - MAIN_W / 2) / (MAIN_W / 2)) * depth_m * np.tan(hfov / 2)
+    y = ((cy - MAIN_H / 2) / (MAIN_H / 2)) * depth_m * np.tan(vfov / 2)
+    return x, y, depth_m
 
 # Model paths
 SCRIPT_DIR = Path(__file__).parent
@@ -85,8 +104,9 @@ USE_V8 = BLOB_PATH == BLOB_PATH_V8
 
 
 NUM_CLASSES = 81 if USE_V8 else 80
-CONF_THRESHOLD = 0.50
+CONF_THRESHOLD = 0.40  # fine-tuned model over-predicts drone — higher bar filters noise
 IOU_THRESHOLD = 0.45
+DEBUG_YOLO = True  # set True to print every detection to console
 
 
 def load_coco_labels():
@@ -101,14 +121,32 @@ def load_coco_labels():
 def parse_yolov8_raw(nn_data):
     """Parse raw YOLOv8 NN output into a list of detection dicts.
     YOLOv8 output shape: (1, 85, N) where 85 = 4 bbox + 81 class scores.
+    Uses depthai 3.5 API (getFirstTensor); older getFirstLayerFp16 is gone.
     Returns list of dicts with keys: xmin, ymin, xmax, ymax, confidence, label.
     """
-    output = np.array(nn_data.getFirstLayerFp16()).reshape(NUM_CLASSES + 4, -1).T
+    try:
+        # depthai 3.5: getFirstTensor returns a numpy-compatible float array
+        tensor = np.array(nn_data.getFirstTensor())
+        # Expected shape (1, 85, 3024) — squeeze the leading batch dim,
+        # then transpose so each row is one anchor's [x, y, w, h, ...classes].
+        if tensor.ndim == 3:
+            tensor = tensor[0]  # (85, 3024)
+        output = tensor.T       # (3024, 85)
+    except Exception as e:
+        if DEBUG_YOLO:
+            print(f"[YOLO] parse error: {e}")
+        return []
+
     boxes = output[:, :4]
     scores = output[:, 4:]
 
     class_ids = np.argmax(scores, axis=1)
     confidences = scores[np.arange(len(scores)), class_ids]
+
+    if DEBUG_YOLO and confidences.size > 0:
+        top5 = np.argsort(confidences)[-5:][::-1]
+        peek = [(int(class_ids[i]), float(confidences[i])) for i in top5]
+        print(f"[YOLO] top5 (class,conf): {peek}  max={float(confidences.max()):.3f}")
 
     mask = confidences > CONF_THRESHOLD
     boxes = boxes[mask]
@@ -175,49 +213,56 @@ class DroneScorer:
 # Drawing — Separate sensor panels
 # ---------------------------------------------------------------------------
 def draw_drone_boxes(frame, fused_tracks):
-    """Draw bounding boxes from fused tracks projected back to camera."""
+    """Draw persistent lock boxes for fused drone tracks.
+
+    Camera-only lock: uses each track's last-stamped YOLO pixel box
+    (`last_cx/cy/w/h`) rather than reprojecting from meters, so the lock
+    stays on-screen at the real last-seen position even when YOLO drops a
+    frame. Color encodes lock state:
+      RED    — confirmed + fresh update this frame (hard lock)
+      YELLOW — confirmed but coasting on Kalman prediction (YOLO miss)
+      CYAN   — candidate, not yet confirmed (acquiring)
+    (Radar "DOP" indicator removed until radar fusion is re-enabled.)
+    """
     for tid, ft in fused_tracks.items():
-        if not ft.is_confirmed:
-            continue
+        if ft.last_cx is None or ft.last_w is None:
+            continue  # never had a YOLO pixel fix yet
+        if not ft.is_confirmed and ft.confidence < DRONE_THRESHOLD * 0.5:
+            continue  # too weak to show
 
-        # Project fused position back to pixel coords
-        # x_m → pixel_x, range → approximate box size
-        px = int(MAIN_W / 2 + ft.x * (MAIN_W / 2) / max(ft.y, 1.0))
-        py = int(MAIN_H / 2)  # approximate vertical center
-        box_size = max(20, int(200 / max(ft.y, 1.0)))  # farther = smaller
+        px, py = ft.last_cx, ft.last_cy
+        w, h = ft.last_w, ft.last_h
+        x1 = max(0, px - w // 2)
+        y1 = max(0, py - h // 2)
+        x2 = min(MAIN_W, px + w // 2)
+        y2 = min(MAIN_H, py + h // 2)
 
-        x1 = max(0, px - box_size // 2)
-        y1 = max(0, py - box_size // 2)
-        x2 = min(MAIN_W, px + box_size // 2)
-        y2 = min(MAIN_H, py + box_size // 2)
-
-        is_drone = ft.confidence >= DRONE_THRESHOLD
-
-        # Source indicators
-        sources = []
-        if ft.has_camera:
-            sources.append("CAM")
-        if ft.has_doppler:
-            sources.append("DOP")
-        src_str = "+".join(sources)
-
-        depth_str = f" {ft.range_m:.1f}m" if ft.range_m > 0 else ""
-
-        if is_drone:
-            label = f"DRONE {ft.confidence:.0%}{depth_str} [{src_str}]"
-            box_color = RED
-            cv2.drawMarker(frame, (px, py), CYAN, cv2.MARKER_CROSS, 12, 1)
+        if ft.is_confirmed and ft.missed_frames == 0:
+            box_color, state, thickness = RED, "LOCK", 2
+        elif ft.is_confirmed:
+            box_color, state, thickness = YELLOW, f"COAST {ft.missed_frames}", 2
         else:
-            label = f"TGT {ft.confidence:.0%}{depth_str}"
-            box_color = YELLOW
+            box_color, state, thickness = CYAN, "ACQ", 1
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, thickness)
+        cv2.drawMarker(frame, (px, py), box_color, cv2.MARKER_CROSS, 12, 1)
+
+        label = f"DRONE [{state}]  id:{ft.track_id}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
         cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), box_color, -1)
         cv2.putText(frame, label, (x1 + 2, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, WHITE, 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, WHITE, 1)
 
-        # Velocity vector
+        if ft.range_m > 0:
+            dist_str = f"{ft.range_m:.1f}m"
+            (dw, dh), _ = cv2.getTextSize(dist_str, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+            dx = px - dw // 2
+            dy = y2 + dh + 8
+            cv2.rectangle(frame, (dx - 4, dy - dh - 4),
+                          (dx + dw + 4, dy + 4), (0, 0, 0), -1)
+            cv2.putText(frame, dist_str, (dx, dy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, box_color, 2)
+
         if abs(ft.vx) > 0.1 or abs(ft.vy) > 0.1:
             vx_px = int(ft.vx * 10)
             vy_px = int(-ft.vy * 10)  # screen Y is inverted
@@ -226,21 +271,14 @@ def draw_drone_boxes(frame, fused_tracks):
     return frame
 
 
-def draw_camera_yolo_boxes(frame, yolo_detections, labels, depth_frame,
-                           num_tracked):
-    """Draw raw YOLO detections with DETECT labels, and camera mode badge."""
-    h_frame, w_frame = frame.shape[:2]
-
-    # Camera role badge — top-left
-    mode_str = f"CAMERA — DETECT+TRACK" if num_tracked > 0 else "CAMERA — DETECTING"
-    mode_col = CYAN if num_tracked > 0 else GREEN
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (5, MAIN_H - 22), (220, MAIN_H - 2), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-    cv2.putText(frame, mode_str, (8, MAIN_H - 7),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, mode_col, 1)
-
+def draw_flying_objects(frame, yolo_detections, labels, depth_frame):
+    """Draw boxes only for flying/airborne YOLO detections — no ground objects."""
+    has_depth = depth_frame is not None
     for det in yolo_detections:
+        lbl_idx = det.label
+        if lbl_idx not in FLYING_CLASSES:
+            continue  # skip all ground objects — no boxes at all
+
         cx = int((det.xmin + det.xmax) / 2 * MAIN_W)
         cy = int((det.ymin + det.ymax) / 2 * MAIN_H)
         w = int((det.xmax - det.xmin) * MAIN_W)
@@ -248,21 +286,36 @@ def draw_camera_yolo_boxes(frame, yolo_detections, labels, depth_frame,
         x1, y1 = cx - w // 2, cy - h // 2
         x2, y2 = cx + w // 2, cy + h // 2
 
-        lbl_idx = det.label
         if isinstance(labels, dict):
             lbl_name = labels.get(lbl_idx, "?")
         else:
             lbl_name = labels[lbl_idx] if lbl_idx < len(labels) else "?"
         conf = det.confidence
 
-        in_flying = lbl_idx in FLYING_CLASSES
-        color = CYAN if in_flying else (100, 100, 100)
-        tag = "DET" if in_flying else ""
+        # Get depth for this detection
+        depth_m = 0.0
+        if has_depth:
+            r = max(5, min(w, h) // 4)
+            dy = np.clip(cy, r, depth_frame.shape[0] - r - 1)
+            dx = np.clip(cx, r, depth_frame.shape[1] - r - 1)
+            region = depth_frame[dy-r:dy+r+1, dx-r:dx+r+1]
+            valid = region[region > 0]
+            if len(valid) > 0:
+                depth_m = float(np.median(valid)) / 1000.0
 
+        color = CYAN
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
-        label = f"{tag} {lbl_name} {conf:.0%}" if tag else f"{lbl_name} {conf:.0%}"
-        cv2.putText(frame, label, (x1, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
+
+        x_m, y_m, z_m = pixel_to_xyz(cx, cy, depth_m)
+        label = f"{lbl_name} {conf:.0%}"
+        cv2.putText(frame, label, (x1, y1 - 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+        if depth_m > 0:
+            xyz_str = f"X{x_m:+.1f} Y{y_m:+.1f} Z{z_m:.1f}m"
+        else:
+            xyz_str = "X?? Y?? Z??"
+        cv2.putText(frame, xyz_str, (x1, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
     return frame
 
 
@@ -306,6 +359,57 @@ def draw_hud(frame, num_drones, detection_mode, nn_dets, doppler_ok,
     return frame
 
 
+def draw_camera_det_panel(panel, camera_dets, num_fused):
+    """
+    Bottom panel showing camera-only detections independently.
+    Shows what the camera sees before Kalman fusion.
+    """
+    h, w = panel.shape[:2]
+    panel[:] = (10, 14, 20)
+
+    cv2.putText(panel, "CAMERA DETECTIONS", (5, 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, CYAN, 1)
+
+    n = len(camera_dets)
+    status = f"{n} flying obj" if n > 0 else "none"
+    cv2.putText(panel, status, (w - 80, 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, GREEN if n > 0 else GRAY, 1)
+
+    if n == 0:
+        cv2.putText(panel, "No airborne objects", (5, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, GRAY, 1)
+        return panel
+
+    # List each camera detection with XYZ
+    y = 32
+    for i, det in enumerate(camera_dets):
+        if y > h - 10:
+            break
+        x_m, y_m, depth_m, score, cx, cy, bw, bh, src = det
+        if depth_m > 0:
+            xyz_str = f"X{x_m:+.1f} Y{y_m:+.1f} Z{depth_m:.1f}m"
+        else:
+            xyz_str = "X?? Y?? Z??"
+
+        # Color by score
+        if score >= DRONE_THRESHOLD:
+            col = YELLOW
+            tag = "SUSPECT"
+        else:
+            col = CYAN
+            tag = "FLYING"
+
+        cv2.circle(panel, (10, y - 3), 4, col, -1)
+        cv2.putText(panel, f"{tag} {src}  {xyz_str}  score:{score:.0%}",
+                    (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.28, col, 1)
+        y += 16
+
+    # Fused count
+    cv2.putText(panel, f"Fused drones: {num_fused}", (5, h - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, MAGENTA if num_fused > 0 else GRAY, 1)
+    return panel
+
+
 def draw_doppler_panel(panel, doppler_data):
     """
     Draw Doppler radar panel: range estimate, motion state, pulse waveform.
@@ -332,9 +436,20 @@ def draw_doppler_panel(panel, doppler_data):
     est_range = doppler_data.get('estimated_range_m', 0.0)
     range_conf = doppler_data.get('range_confidence', 0.0)
     duty = doppler_data.get('duty_cycle', 0.0)
+    raw_gpio = doppler_data.get('raw_gpio', 1)
+    edge_count = doppler_data.get('edge_count', 0)
+
+    # Raw GPIO indicator — Red square = GPIO LOW (motion), Green = HIGH (idle)
+    # If this never turns red despite the sensor's LED blinking, the GPIO
+    # isn't actually connected to Pin 29 or DIP switch is wrong voltage.
+    gpio_col = RED if raw_gpio == 0 else DARK_GREEN
+    cv2.rectangle(panel, (w - 32, 4), (w - 18, 14), gpio_col, -1)
+    cv2.putText(panel, f"GPIO:{raw_gpio}  edges:{edge_count}", (w - 140, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, gpio_col, 1)
 
     # --- Range estimate (primary readout) ---
-    if est_range > 0.1 and range_conf > 0.05:
+    # Lowered threshold: show range even at very low confidence
+    if est_range > 0.1 and range_conf > 0.01:
         if est_range < 3:
             range_col = RED
         elif est_range < 7:
@@ -381,18 +496,24 @@ def draw_doppler_panel(panel, doppler_data):
     cv2.putText(panel, f"Signal: {activity:.0%}", (5, bar_y2 + 16),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.25, GRAY, 1)
 
-    # Drone signature indicator
+    # Radar-only detection verdict (independent of camera)
+    # Lowered thresholds so weak/short signals still register
     is_drone, d_conf = False, 0.0
-    if freq > 5.0 and activity > 0.3:
+    if freq > 3.0 and activity > 0.2:
+        # Rapid toggling = rotor micro-Doppler signature
         is_drone = True
-        d_conf = min(1.0, freq / 30.0) * activity
-    elif motion and freq > 2.0 and activity > 0.5:
+        d_conf = min(1.0, freq / 20.0) * max(activity, 0.3)
+    elif motion and duty > 0.15:
+        # Sustained motion — moving object in beam
         is_drone = True
-        d_conf = 0.3
+        d_conf = min(0.5, duty * 2.0)
 
     if is_drone:
-        cv2.putText(panel, f"DRONE SIG {d_conf:.0%}",
-                    (w - 110, bar_y2 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.3, RED, 1)
+        cv2.putText(panel, f"DRONE {d_conf:.0%}",
+                    (w - 90, bar_y2 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.3, RED, 1)
+    elif motion:
+        cv2.putText(panel, "MOTION",
+                    (w - 70, bar_y2 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.3, YELLOW, 1)
 
     # Pulse history waveform
     history = doppler_data.get('history', [])
@@ -459,10 +580,11 @@ def draw_fused_scope(panel, fused_tracks, sweep_angle):
     cv2.putText(panel, "20m", (cx + radius - 12, cy - 3),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.2, (0, 60, 0), 1)
 
-    # Plot fused tracks
+    # Plot fused tracks. Show candidates too (dimmer) so acquisition is
+    # visible on the scope instead of appearing only once confirmed.
     max_range = 20.0
     for tid, ft in fused_tracks.items():
-        if not ft.is_confirmed:
+        if not ft.is_confirmed and ft.confidence < DRONE_THRESHOLD * 0.5:
             continue
 
         # Bearing → angle on scope, range → distance from center
@@ -792,7 +914,7 @@ def main():
                     doppler_data = doppler.get_data()
 
             # --- Build camera detection candidates for Kalman filter ---
-            camera_dets = []  # (x_m, depth_m, confidence, cx_px, cy_px, w_px, h_px, src)
+            camera_dets = []  # (x_m, y_m, depth_m, confidence, cx_px, cy_px, w_px, h_px, src)
             detection_mode = "FUSION"
             nn_det_count = len(yolo_detections)
 
@@ -839,23 +961,33 @@ def main():
 
                     det_depth_m = get_depth_at(cx, cy, w, h)
 
-                    # Convert pixel x to metres offset from center
-                    # Using camera FOV (~70 deg horizontal for OAK-D)
-                    hfov_rad = np.radians(70)
-                    x_norm = (cx - MAIN_W / 2) / (MAIN_W / 2)  # -1 to +1
-                    x_m = x_norm * det_depth_m * np.tan(hfov_rad / 2) if det_depth_m > 0 else x_norm * 5.0
+                    if det_depth_m > 0:
+                        x_m, y_m, _ = pixel_to_xyz(cx, cy, det_depth_m)
+                    else:
+                        # Fall back to a 5 m stand-in so Kalman still gets a bearing
+                        # when stereo depth is invalid, matching prior behavior.
+                        x_m, y_m, _ = pixel_to_xyz(cx, cy, 5.0)
 
                     if isinstance(labels, dict):
                         lbl_name = labels.get(yolo_label, "?")
                     else:
                         lbl_name = labels[yolo_label] if yolo_label < len(labels) else "?"
-                    camera_dets.append((x_m, det_depth_m, drone_score,
+                    camera_dets.append((x_m, y_m, det_depth_m, drone_score,
                                         cx, cy, w, h, f"Y:{lbl_name}"))
 
             # --- Run Kalman fusion update ---
+            # Camera-only lock for now: radar fusion is intentionally disabled
+            # while we stabilize the camera track. The Doppler reader still
+            # runs and its panel updates live; we just don't feed it into the
+            # Kalman filter. Re-enable by passing `doppler_data` here once the
+            # radar-assisted lock is wanted again.
+            # We pass the pixel box (cx, cy, w, h) along with (x_m, depth_m,
+            # score) so the tracker can remember where to redraw the lock
+            # box across YOLO-miss frames.
             fused_tracks = fusion_tracker.update(
-                camera_dets=[(d[0], d[1], d[2]) for d in camera_dets],
-                doppler_data=doppler_data,
+                camera_dets=[(d[0], d[2], d[3], d[4], d[5], d[6], d[7])
+                             for d in camera_dets],
+                doppler_data=None,
             )
 
             # === BUILD DISPLAY ===
@@ -880,15 +1012,16 @@ def main():
                 cv2.putText(main_panel, "NO CAMERA", (200, 240),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, RED, 2)
 
-            # Count confirmed tracks for display
+            # Count confirmed tracks. Camera-only lock: the has_doppler
+            # requirement is dropped until radar fusion is re-enabled.
             num_drones = sum(1 for ft in fused_tracks.values()
-                             if ft.is_confirmed and ft.confidence >= DRONE_THRESHOLD)
+                             if ft.is_confirmed and ft.confidence >= DRONE_THRESHOLD
+                             and ft.has_camera)
 
-            # Draw raw YOLO boxes on camera panel
+            # Draw flying object boxes (only airborne YOLO classes — no ground objects)
             if has_rgb and yolo_detections:
-                main_panel = draw_camera_yolo_boxes(main_panel, yolo_detections,
-                                                     labels, depth_frame,
-                                                     num_drones)
+                main_panel = draw_flying_objects(main_panel, yolo_detections,
+                                                labels, depth_frame)
 
             # Draw fused drone boxes
             main_panel = draw_drone_boxes(main_panel, fused_tracks)
@@ -909,7 +1042,9 @@ def main():
                 depth_panel = cv2.resize(depth_color, (DEPTH_W, MAIN_H))
                 scale_x = DEPTH_W / MAIN_W
                 for ft in fused_tracks.values():
-                    if ft.is_confirmed and ft.confidence >= DRONE_THRESHOLD:
+                    # Camera-only gate — has_doppler dropped with radar fusion.
+                    if (ft.is_confirmed and ft.confidence >= DRONE_THRESHOLD
+                            and ft.has_camera):
                         # Project back to pixel for depth panel marker
                         if ft.y > 0:
                             px_x = int((ft.x / (ft.y * np.tan(np.radians(35))) + 1) / 2 * DEPTH_W)
@@ -925,22 +1060,28 @@ def main():
 
             top_row = np.hstack([main_panel, depth_panel])
 
-            # --- Bottom row: Doppler | Fused Scope ---
-            doppler_pw = CANVAS_W // 2
-            fused_pw = CANVAS_W - doppler_pw
+            # --- Bottom row: Camera Dets | Radar Dets | Kalman Fused Scope ---
+            cam_pw = CANVAS_W // 3
+            dop_pw = CANVAS_W // 3
+            fused_pw = CANVAS_W - cam_pw - dop_pw
 
-            doppler_panel = np.zeros((BOTTOM_H, doppler_pw, 3), dtype=np.uint8)
+            cam_det_panel = np.zeros((BOTTOM_H, cam_pw, 3), dtype=np.uint8)
+            doppler_panel = np.zeros((BOTTOM_H, dop_pw, 3), dtype=np.uint8)
             fused_panel = np.zeros((BOTTOM_H, fused_pw, 3), dtype=np.uint8)
 
+            cam_det_panel = draw_camera_det_panel(cam_det_panel, camera_dets,
+                                                   num_drones)
             doppler_panel = draw_doppler_panel(doppler_panel, doppler_data)
             sweep_angle += 0.08
             fused_panel = draw_fused_scope(fused_panel, fused_tracks, sweep_angle)
 
-            # Separator line
-            cv2.line(doppler_panel, (doppler_pw - 1, 0), (doppler_pw - 1, BOTTOM_H),
+            # Separator lines
+            cv2.line(cam_det_panel, (cam_pw - 1, 0), (cam_pw - 1, BOTTOM_H),
+                     (40, 60, 80), 1)
+            cv2.line(doppler_panel, (dop_pw - 1, 0), (dop_pw - 1, BOTTOM_H),
                      (40, 60, 80), 1)
 
-            bottom_row = np.hstack([doppler_panel, fused_panel])
+            bottom_row = np.hstack([cam_det_panel, doppler_panel, fused_panel])
 
             # --- Composite canvas ---
             # Separator line between top and bottom
