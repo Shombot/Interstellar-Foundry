@@ -1,206 +1,235 @@
 #!/usr/bin/env python3
 """
-CQRobot 10.525GHz Doppler Microwave Motion Sensor — Threaded Reader
---------------------------------------------------------------------
-Reads the GPIO digital output (active LOW) in a background thread and
-provides motion state, event count, and pulse frequency analysis.
+CQRobot 10.525GHz Doppler Microwave Motion Sensor — GPIO Reader
+----------------------------------------------------------------
+Uses python-libgpiod to poll the sensor's digital output at high rate.
+Matches the approach of the working C motion_sensor program: simple
+input polling, no edge events, no bias flags.
 
-The sensor outputs a binary signal:
-  0 = motion detected (active low)
-  1 = no motion
-
-By measuring the rate and duration of motion pulses we can infer
-a coarse "activity level" that correlates with drone propeller
-micro-Doppler signatures (rapid, periodic toggling).
+The sensor output (active LOW):
+  0 = motion detected ("Somebody is in this area!")
+  1 = no motion ("No one!")
 
 Wiring:
-  Red   -> 3.3V (Pin 1 or 17)
-  Black -> GND  (Pin 6, 9, 14, etc.)
-  Green -> Pin 29 (GPIO01 / PQ.05 / gpiochip0 line 105)
+  Red   -> 5V (Pin 2 or 4)
+  Black -> GND
+  Green -> Pin 29 (gpiochip0 line 105)
 """
 
-import subprocess
 import threading
 import time
 from collections import deque
 
 import numpy as np
 
+import gpiod
+from gpiod.line import Direction
 
-CHIP = "gpiochip0"
-LINE = 105  # GPIO01 = PQ.05 = physical pin 29
+
+CHIP_PATH = "/dev/gpiochip0"
+LINE = 105  # Pin 29 — confirmed working with C motion_sensor program
 
 
 class DopplerReader:
-    """Background thread that polls the CQRobot Doppler sensor via gpioget."""
+    """
+    High-rate polling reader matching the working C implementation.
+    No edge events, no bias — just rapid get_value() calls.
+    """
 
-    def __init__(self, chip=CHIP, line=LINE, poll_hz=100):
-        self.chip = chip
+    def __init__(self, chip_path=CHIP_PATH, line=LINE, poll_hz=100):
+        self.chip_path = chip_path
         self.line = line
         self.poll_interval = 1.0 / poll_hz
 
         self.running = False
-        self.thread = None
+        self.poll_thread = None
+        self.analysis_thread = None
         self.lock = threading.Lock()
 
         # State
         self.motion = False
-        self.motion_events = 0          # total rising-edge count
-        self.last_motion_time = 0.0     # epoch of last motion=True
-        self.last_idle_time = 0.0       # epoch of last motion=False
+        self.raw_gpio = 1
+        self.motion_events = 0
+        self.last_motion_time = 0.0
+        self.last_idle_time = 0.0
         self.connected = False
+        self.edge_count = 0
 
-        # Pulse frequency analysis (drone propellers create rapid toggling)
-        self._edge_times = deque(maxlen=50)   # timestamps of motion edges
-        self.pulse_freq_hz = 0.0              # estimated toggle frequency
-        self.activity_level = 0.0             # 0.0–1.0 coarse activity metric
+        # Pulse frequency analysis
+        self._edge_times = deque(maxlen=100)
+        self.pulse_freq_hz = 0.0
+        self.activity_level = 0.0
 
-        # Short history for dashboard display
-        self.motion_history = deque(maxlen=200)  # (timestamp, motion_bool)
+        # History for dashboard
+        self.motion_history = deque(maxlen=400)
+        self.motion_history.append((time.time(), False))
 
-        # Range estimation from signal characteristics
-        # The 10.525GHz CW Doppler sensor's detection envelope (duty cycle,
-        # pulse rate, sustained activity) correlates with target proximity:
-        #   - closer targets → stronger reflected signal → higher duty cycle
-        #   - farther targets → weaker signal → sporadic, low duty cycle
-        # Max detection range ~7-12m depending on target RCS.
-        self.estimated_range_m = 0.0     # coarse range estimate
-        self.range_confidence = 0.0      # how much to trust the estimate
-        self._duty_cycle = 0.0           # fraction of time in motion state
+        # Range estimation
+        self.estimated_range_m = 0.0
+        self.range_confidence = 0.0
+        self._duty_cycle = 0.0
+
+        self.last_error = ""
 
     def start(self):
         self.running = True
-        self.thread = threading.Thread(target=self._poll_loop, daemon=True)
-        self.thread.start()
+        self.poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self.poll_thread.start()
+        self.analysis_thread = threading.Thread(target=self._analysis_loop, daemon=True)
+        self.analysis_thread.start()
 
     def stop(self):
         self.running = False
-        if self.thread:
-            self.thread.join(timeout=2)
-
-    def _read_gpio(self):
-        try:
-            r = subprocess.run(
-                ["gpioget", "-B", "pull-up", self.chip, str(self.line)],
-                capture_output=True, text=True, timeout=1)
-            return r.stdout.strip()
-        except Exception:
-            return None
+        for t in (self.poll_thread, self.analysis_thread):
+            if t:
+                t.join(timeout=2)
 
     def _poll_loop(self):
-        prev_motion = None
-        # Check sensor presence once
-        val = self._read_gpio()
-        if val is not None:
-            with self.lock:
-                self.connected = True
-
+        """
+        Simple polling loop — same approach as the working C program.
+        Request line as INPUT with no bias, poll get_value() rapidly.
+        """
         while self.running:
-            val = self._read_gpio()
-            if val is None:
+            req = None
+            try:
+                req = gpiod.request_lines(
+                    self.chip_path,
+                    consumer="doppler-reader",
+                    config={
+                        self.line: gpiod.LineSettings(
+                            direction=Direction.INPUT,
+                        )
+                    },
+                )
+
+                with self.lock:
+                    self.connected = True
+                    self.last_error = ""
+
+                prev_motion = None
+
+                while self.running:
+                    val = req.get_value(self.line)
+                    # gpiod v2: compare against Value enum directly
+                    from gpiod.line import Value
+                    raw = 0 if val == Value.INACTIVE else 1
+                    motion = (raw == 0)  # active LOW
+                    now = time.time()
+
+                    with self.lock:
+                        self.raw_gpio = raw
+                        self.motion = motion
+                        self.motion_history.append((now, motion))
+
+                        if motion:
+                            self.last_motion_time = now
+
+                        # Detect transitions
+                        if prev_motion is not None and motion != prev_motion:
+                            self.edge_count += 1
+                            self._edge_times.append(now)
+                            if motion:
+                                self.motion_events += 1
+                            else:
+                                self.last_idle_time = now
+
+                    prev_motion = motion
+                    time.sleep(self.poll_interval)
+
+            except Exception as e:
                 with self.lock:
                     self.connected = False
-                time.sleep(0.5)
-                continue
+                    self.last_error = f"{type(e).__name__}: {e}"[:200]
+            finally:
+                if req:
+                    try:
+                        req.release()
+                    except Exception:
+                        pass
+                if self.running:
+                    time.sleep(1)
 
+    def _analysis_loop(self):
+        """Compute derived metrics: pulse frequency, duty cycle, range."""
+        while self.running:
             now = time.time()
-            motion = (val == "0")  # active low
-
             with self.lock:
-                self.connected = True
-                self.motion = motion
-                self.motion_history.append((now, motion))
-
-                if motion:
-                    self.last_motion_time = now
-
-                # Detect edges (transitions)
-                if prev_motion is not None and motion != prev_motion:
-                    self._edge_times.append(now)
-                    if motion:
-                        self.motion_events += 1
-                    if not motion:
-                        self.last_idle_time = now
-
-                # Compute pulse frequency from recent edges
-                edges = list(self._edge_times)
-                if len(edges) >= 4:
-                    # Only consider edges in last 2 seconds
-                    recent = [t for t in edges if now - t < 2.0]
-                    if len(recent) >= 4:
-                        intervals = [recent[i+1] - recent[i]
-                                     for i in range(len(recent)-1)]
-                        avg_interval = sum(intervals) / len(intervals)
-                        if avg_interval > 0:
-                            self.pulse_freq_hz = 1.0 / avg_interval
-                        else:
-                            self.pulse_freq_hz = 0.0
+                recent_edges = [t for t in self._edge_times if now - t < 2.0]
+                if len(recent_edges) >= 2:
+                    span = recent_edges[-1] - recent_edges[0]
+                    if span > 0:
+                        self.pulse_freq_hz = (len(recent_edges) - 1) / span
                     else:
-                        self.pulse_freq_hz = max(0, self.pulse_freq_hz - 0.5)
+                        self.pulse_freq_hz = 0.0
                 else:
-                    self.pulse_freq_hz = 0.0
+                    self.pulse_freq_hz = max(0, self.pulse_freq_hz * 0.8)
 
-                # Activity level: based on recent motion events in last 2s
-                recent_events = sum(1 for t, m in self.motion_history
-                                    if now - t < 2.0 and m)
-                total_recent = sum(1 for t, m in self.motion_history
-                                   if now - t < 2.0)
-                if total_recent > 0:
-                    self.activity_level = min(1.0, recent_events / total_recent)
+                recent_hist = [(t, m) for t, m in self.motion_history
+                               if now - t < 2.0]
+                if len(recent_hist) >= 2:
+                    motion_time = 0.0
+                    total_time = 0.0
+                    for i in range(1, len(recent_hist)):
+                        dt = recent_hist[i][0] - recent_hist[i-1][0]
+                        total_time += dt
+                        if recent_hist[i-1][1]:
+                            motion_time += dt
+                    dt_last = now - recent_hist[-1][0]
+                    total_time += dt_last
+                    if self.motion:
+                        motion_time += dt_last
+                    if total_time > 0:
+                        self._duty_cycle = min(1.0, motion_time / total_time)
+                    else:
+                        self._duty_cycle = 1.0 if self.motion else 0.0
                 else:
-                    self.activity_level = 0.0
+                    self._duty_cycle = 1.0 if self.motion else 0.0
 
-                # --- Range estimation from signal envelope ---
-                # Duty cycle: fraction of recent samples where motion=True
-                # Higher duty cycle → closer target (stronger return)
-                self._duty_cycle = (recent_events / total_recent
-                                    if total_recent > 0 else 0.0)
+                self.activity_level = self._duty_cycle
 
-                if self._duty_cycle > 0.05:
-                    # Map duty cycle to range: 100% duty → ~0.5m, ~5% → ~10m
-                    # Inverse square law: signal strength ∝ 1/r^2
-                    # duty_cycle ∝ signal_strength ∝ 1/r^2
-                    # So r ∝ 1/sqrt(duty_cycle)
-                    MAX_RANGE = 10.0  # sensor max effective range (m)
+                recent_edge_count = len(recent_edges)
+                has_signal = (self._duty_cycle > 0.01 or
+                              recent_edge_count >= 1 or
+                              self.motion)
+
+                if has_signal:
+                    MAX_RANGE = 10.0
                     MIN_RANGE = 0.5
+                    effective_duty = max(self._duty_cycle, 0.02)
                     raw_range = min(MAX_RANGE,
-                                    MIN_RANGE / max(self._duty_cycle, 0.01) ** 0.5)
-
-                    # Refine with pulse frequency — faster toggling = closer
-                    if self.pulse_freq_hz > 1.0:
+                                    MIN_RANGE / effective_duty ** 0.5)
+                    if self.pulse_freq_hz > 0.5:
                         freq_factor = max(0.5, 1.0 - self.pulse_freq_hz / 60.0)
                         raw_range *= freq_factor
+                    raw_range = float(np.clip(raw_range, MIN_RANGE, MAX_RANGE))
 
-                    raw_range = np.clip(raw_range, MIN_RANGE, MAX_RANGE)
-
-                    # Smooth the estimate (low-pass filter)
-                    alpha = 0.15  # smoothing factor
+                    alpha = 0.2
                     if self.estimated_range_m > 0:
                         self.estimated_range_m = (alpha * raw_range +
                                                   (1 - alpha) * self.estimated_range_m)
                     else:
                         self.estimated_range_m = raw_range
 
-                    # Confidence: higher with more data and sustained motion
                     self.range_confidence = min(1.0,
-                        self._duty_cycle * 0.6 +
-                        min(self.pulse_freq_hz / 20.0, 0.4))
+                        self._duty_cycle * 0.5 +
+                        min(self.pulse_freq_hz / 15.0, 0.3) +
+                        min(recent_edge_count / 10.0, 0.3))
                 else:
-                    # No motion — decay range estimate
-                    self.estimated_range_m *= 0.98
-                    self.range_confidence *= 0.95
+                    self.estimated_range_m *= 0.97
+                    self.range_confidence *= 0.92
 
-            prev_motion = motion
-            time.sleep(self.poll_interval)
+            time.sleep(0.1)
 
     def get_data(self):
-        """Thread-safe snapshot of current Doppler sensor state."""
         with self.lock:
             now = time.time()
-            motion_age = now - self.last_motion_time if self.last_motion_time else float('inf')
+            motion_age = (now - self.last_motion_time
+                          if self.last_motion_time else float('inf'))
             return {
                 'connected': self.connected,
                 'motion': self.motion,
+                'raw_gpio': self.raw_gpio,
+                'edge_count': self.edge_count,
                 'motion_events': self.motion_events,
                 'last_motion_time': self.last_motion_time,
                 'motion_age_s': motion_age,
@@ -210,19 +239,14 @@ class DopplerReader:
                 'estimated_range_m': self.estimated_range_m,
                 'range_confidence': self.range_confidence,
                 'history': list(self.motion_history),
+                'gpiomon_error': self.last_error,
             }
 
     def is_drone_signature(self):
-        """
-        Heuristic: drone propellers cause rapid, periodic toggling.
-        Returns (is_drone_like, confidence).
-        """
         with self.lock:
-            # Drone propellers typically cause rapid oscillation (>5 Hz toggle)
             if self.pulse_freq_hz > 5.0 and self.activity_level > 0.3:
                 conf = min(1.0, self.pulse_freq_hz / 30.0) * self.activity_level
                 return True, conf
-            # Sustained motion with moderate frequency could be a hovering drone
             if self.motion and self.pulse_freq_hz > 2.0 and self.activity_level > 0.5:
                 return True, 0.3
             return False, 0.0

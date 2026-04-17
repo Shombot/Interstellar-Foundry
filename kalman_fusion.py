@@ -305,7 +305,7 @@ class MultiDroneTracker:
             elif doppler_active and freq > 2.0 and act > 0.5:
                 doppler_conf = 0.3
 
-        has_doppler_range = doppler_range > 0.1 and doppler_range_conf > 0.1
+        has_doppler_range = doppler_range > 0.1 and doppler_range_conf > 0.02
 
         # Predict all existing tracks
         self.predict_all(doppler_active,
