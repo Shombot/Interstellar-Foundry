@@ -66,8 +66,27 @@ DARK_GREEN = (0, 100, 0)
 
 DRONE_THRESHOLD = 0.30
 
+# OAK-D RGB camera horizontal FOV (degrees). VFOV is derived from the frame
+# aspect ratio so both stay consistent if MAIN_W/MAIN_H change.
+CAMERA_HFOV_DEG = 70.0
+
 # COCO classes that are airborne / could be a drone
 FLYING_CLASSES = {4, 14, 29, 33}  # airplane, bird, frisbee, kite
+
+
+def pixel_to_xyz(cx, cy, depth_m, hfov_deg=CAMERA_HFOV_DEG):
+    """Project a pixel + depth into camera-frame XYZ (meters).
+
+    Convention: X = right, Y = down, Z = forward. Origin at RGB camera.
+    Returns (0, 0, 0) when depth is unknown.
+    """
+    if depth_m <= 0:
+        return 0.0, 0.0, 0.0
+    hfov = np.radians(hfov_deg)
+    vfov = 2 * np.arctan((MAIN_H / MAIN_W) * np.tan(hfov / 2))
+    x = ((cx - MAIN_W / 2) / (MAIN_W / 2)) * depth_m * np.tan(hfov / 2)
+    y = ((cy - MAIN_H / 2) / (MAIN_H / 2)) * depth_m * np.tan(vfov / 2)
+    return x, y, depth_m
 
 # Model paths
 SCRIPT_DIR = Path(__file__).parent
@@ -105,9 +124,16 @@ class DroneScorer:
 # Drawing — Separate sensor panels
 # ---------------------------------------------------------------------------
 def draw_drone_boxes(frame, fused_tracks):
-    """Draw bounding boxes from fused tracks projected back to camera."""
+    """Draw bounding boxes from fused tracks projected back to camera.
+
+    Only confirmed tracks whose confidence has crossed DRONE_THRESHOLD
+    are drawn — low-confidence "TGT" boxes are suppressed so nothing is
+    rendered when there's no drone in frame.
+    """
     for tid, ft in fused_tracks.items():
         if not ft.is_confirmed:
+            continue
+        if ft.confidence < DRONE_THRESHOLD:
             continue
 
         # Project fused position back to pixel coords
@@ -121,8 +147,6 @@ def draw_drone_boxes(frame, fused_tracks):
         x2 = min(MAIN_W, px + box_size // 2)
         y2 = min(MAIN_H, py + box_size // 2)
 
-        is_drone = ft.confidence >= DRONE_THRESHOLD
-
         # Source indicators
         sources = []
         if ft.has_camera:
@@ -133,13 +157,9 @@ def draw_drone_boxes(frame, fused_tracks):
 
         depth_str = f" {ft.range_m:.1f}m" if ft.range_m > 0 else ""
 
-        if is_drone:
-            label = f"DRONE {ft.confidence:.0%}{depth_str} [{src_str}]"
-            box_color = RED
-            cv2.drawMarker(frame, (px, py), CYAN, cv2.MARKER_CROSS, 12, 1)
-        else:
-            label = f"TGT {ft.confidence:.0%}{depth_str}"
-            box_color = YELLOW
+        label = f"DRONE {ft.confidence:.0%}{depth_str} [{src_str}]"
+        box_color = RED
+        cv2.drawMarker(frame, (px, py), CYAN, cv2.MARKER_CROSS, 12, 1)
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
@@ -183,11 +203,31 @@ def draw_camera_yolo_boxes(frame, yolo_detections, labels, depth_frame,
         conf = det.confidence
 
         in_flying = lbl_idx in FLYING_CLASSES
-        color = CYAN if in_flying else (100, 100, 100)
-        tag = "DET" if in_flying else ""
+        if in_flying:
+            # No rectangle — draw_drone_boxes renders the fused lock box
+            # for flying targets. Here we only stamp an XYZ tag at the real
+            # YOLO centroid, so the position readout tracks the drone even
+            # though the visible box comes from the Kalman filter.
+            depth_m = 0.0
+            if depth_frame is not None:
+                r = max(5, min(w, h) // 4)
+                dy = np.clip(cy, r, depth_frame.shape[0] - r - 1)
+                dx = np.clip(cx, r, depth_frame.shape[1] - r - 1)
+                region = depth_frame[dy-r:dy+r+1, dx-r:dx+r+1]
+                valid = region[region > 0]
+                if len(valid) > 0:
+                    depth_m = float(np.median(valid)) / 1000.0
+            xm, ym, zm = pixel_to_xyz(cx, cy, depth_m)
+            tag = (f"X{xm:+.1f} Y{ym:+.1f} Z{zm:.1f}m"
+                   if depth_m > 0 else "X?? Y?? Z??")
+            cv2.putText(frame, tag, (x1, y2 + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, CYAN, 1)
+            continue
 
+        # Ground-object box — kept so YOLO false positives stay visible.
+        color = (100, 100, 100)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
-        label = f"{tag} {lbl_name} {conf:.0%}" if tag else f"{lbl_name} {conf:.0%}"
+        label = f"{lbl_name} {conf:.0%}"
         cv2.putText(frame, label, (x1, y1 - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
     return frame

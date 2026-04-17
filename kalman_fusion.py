@@ -311,10 +311,14 @@ class MultiDroneTracker:
         self.predict_all(doppler_active,
                          doppler_data['activity_level'] if doppler_data else 0.0)
 
-        # Associate camera detections with existing tracks
+        # Associate camera detections with existing tracks. Gate widens
+        # with range because stereo-depth noise grows roughly linearly with
+        # distance — a flat 3 m was spawning duplicate tracks on the same
+        # drone whenever depth jittered.
         used_det = set()
         for tid, kf in list(self.tracks.items()):
-            best_dist = 3.0  # max association distance in metres
+            est_depth = max(0.0, kf.x[1])
+            best_dist = 3.0 + 0.15 * est_depth
             best_idx = -1
             for i, det in enumerate(camera_dets):
                 if i in used_det:
