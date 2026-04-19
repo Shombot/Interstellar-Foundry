@@ -6,8 +6,9 @@
 train: ../datasets/drone_detect/images/train
 val:   ../datasets/drone_detect/images/val
 
-# 81 classes: 80 COCO + 1 drone
-nc: 81
+# ~~81 classes: 80 COCO + 1 drone~~
+#CHANGED TO 1
+nc: 1
 
 names:
   0:  person
