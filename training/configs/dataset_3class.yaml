@@ -1,0 +1,10 @@
+path: /content/kaggle_dl/drone_resplit
+train: train/images
+val:   val/images
+test:  test/images
+
+nc: 3
+names:
+  0: airplane
+  1: drone
+  2: helicopter
