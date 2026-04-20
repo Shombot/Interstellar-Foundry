@@ -52,3 +52,7 @@ yolov6n_coco_rvc2.tar.xz
 depthai/
 depthai-python/
 ros2_ws/src/depthai-ros/
+
+# At the bottom of .gitignore, add:
+!yolov6n_model/*.blob
+!yolov6n_model/config.json
