@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Fine-tune YOLOv6n to add drone detection (class 80).
------------------------------------------------------
-Uses the Ultralytics API with YOLOv6n-R2 COCO checkpoint.
+Fine-tune YOLOv8n for single-class drone detection (nc=1, class 0 = drone).
+---------------------------------------------------------------------------
+Uses the Ultralytics API with YOLOv8n COCO pretrained checkpoint.
 
 Prerequisites:
     pip install ultralytics onnx onnxruntime
@@ -14,8 +14,8 @@ Usage:
     # 3. Export to ONNX + blob (see export_blob.sh)
 
 The script freezes the backbone for the first phase, then unfreezes
-for full fine-tuning. This preserves COCO features while learning
-the new drone class.
+for full fine-tuning. Phase 1 learns the drone detection head;
+Phase 2 refines the entire network.
 """
 
 import argparse
@@ -40,13 +40,13 @@ PRETRAINED   = PROJECT_ROOT / "yolov8n.pt"
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune YOLOv8n + drone class")
+    parser = argparse.ArgumentParser(description="Fine-tune YOLOv8n — single-class drone detector")
     parser.add_argument("--epochs", type=int, default=100,
                         help="Total training epochs (default: 100)")
     parser.add_argument("--batch", type=int, default=16,
                         help="Batch size (default: 16)")
-    parser.add_argument("--imgsz", type=int, default=512,
-                        help="Input image size (default: 512, matches OAK pipeline)")
+    parser.add_argument("--imgsz", type=int, default=640,
+                        help="Input image size (default: 640)")
     parser.add_argument("--freeze", type=int, default=10,
                         help="Freeze backbone for first N epochs (default: 10)")
     parser.add_argument("--device", type=str, default="0",
@@ -81,7 +81,7 @@ def main():
     print(f"  Device     : {args.device}")
     print("=" * 60)
 
-    # Phase 1: Backbone frozen — learn drone class head without forgetting COCO
+    # Phase 1: Backbone frozen — learn drone detection head
     print(f"\n--- Phase 1: Frozen backbone ({args.freeze} epochs) ---")
     model.train(
         data=str(DATASET_YAML),

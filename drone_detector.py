@@ -70,10 +70,6 @@ DARK_GREEN = (0, 100, 0)
 
 DRONE_THRESHOLD = 0.30
 
-# COCO classes that are airborne / could be a drone
-# 80 = drone (available after fine-tuning, see training/)
-FLYING_CLASSES = {4, 14, 29, 33, 80}  # airplane, bird, frisbee, kite, drone
-
 # Model paths
 SCRIPT_DIR = Path(__file__).parent
 BLOB_PATH_V8 = SCRIPT_DIR / "yolov6n_model" / "best_openvino_2022.1_6shave.blob"
@@ -83,30 +79,33 @@ ARCHIVE_PATH = SCRIPT_DIR / "yolov6n_coco_rvc2.tar.xz"
 CONFIG_PATH = SCRIPT_DIR / "yolov6n_model" / "config.json"
 USE_V8 = BLOB_PATH == BLOB_PATH_V8
 
-
-NUM_CLASSES = 81 if USE_V8 else 80
+# nc=1 for fine-tuned drone model, 80 COCO classes for V6 fallback
+NUM_CLASSES = 1 if USE_V8 else 80
 CONF_THRESHOLD = 0.50
 IOU_THRESHOLD = 0.45
 
+# COCO classes that are airborne / could be a drone (V6 fallback only)
+FLYING_CLASSES = {0} if USE_V8 else {4, 14, 29, 33}
+
 
 def load_coco_labels():
+    if USE_V8:
+        return ["drone"]
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
-    labels = cfg['model']['heads'][0]['metadata']['classes']
-    if USE_V8 and len(labels) < 81:
-        labels.append("drone")
-    return labels
+    return cfg['model']['heads'][0]['metadata']['classes']
 
 
 def parse_yolov8_raw(nn_data):
     """Parse raw YOLOv8 NN output into a list of detection dicts.
-    YOLOv8 output shape: (1, 85, N) where 85 = 4 bbox + 81 class scores.
+    nc=1: output shape (1, 5, N) where 5 = 4 bbox + 1 class score.
     Returns list of dicts with keys: xmin, ymin, xmax, ymax, confidence, label.
     """
     output = np.array(nn_data.getFirstLayerFp16()).reshape(NUM_CLASSES + 4, -1).T
     boxes = output[:, :4]
     scores = output[:, 4:]
 
+    # nc=1: single score column, class always 0
     class_ids = np.argmax(scores, axis=1)
     confidences = scores[np.arange(len(scores)), class_ids]
 
@@ -153,10 +152,16 @@ def parse_yolov8_raw(nn_data):
 # Camera-only drone scorer
 # ---------------------------------------------------------------------------
 class DroneScorer:
+    def __init__(self, single_class=False):
+        self.single_class = single_class
+
     def score(self, yolo_label, yolo_conf, depth_m):
-        # Direct drone class (available after fine-tuning)
-        if yolo_label == 80:
-            return min(0.95, 0.7 + yolo_conf * 0.25), f"drone {yolo_conf:.0%}"
+        if self.single_class:
+            # nc=1 model: class 0 = drone, the only possible class
+            if yolo_label == 0:
+                return min(0.95, 0.7 + yolo_conf * 0.25), f"drone {yolo_conf:.0%}"
+            return 0.0, "unknown"
+        # V6 fallback: COCO proxy scoring
         if yolo_label is not None and yolo_label not in FLYING_CLASSES:
             return 0.0, "ground-obj"
         if yolo_label == 14:
@@ -640,22 +645,26 @@ def main():
         print(f"Video: {args.video} ({total_frames} frames @ {video_fps:.0f}fps)")
         # Prefer fine-tuned model (drone class), fall back to stock COCO
         FINETUNED_PT = SCRIPT_DIR / "training" / "runs" / "drone_phase2" / "weights" / "best.pt"
-        DOWNLOADED_PT = Path("/Users/rasho/Downloads/best.pt")
+        DOWNLOADED_PT = Path("/Users/rasho/Downloads/best (1).pt")
         if FINETUNED_PT.exists():
             yolo_model = YOLO(str(FINETUNED_PT))
-            print(f"YOLOv8n (drone-finetuned) loaded for CPU inference")
+            print("YOLOv8n (drone-finetuned) loaded for CPU inference")
         elif DOWNLOADED_PT.exists():
             yolo_model = YOLO(str(DOWNLOADED_PT))
-            print(f"YOLOv8n (drone-finetuned) loaded for CPU inference")
+            print("YOLOv8n (drone-finetuned) loaded for CPU inference")
+        elif Path("/Users/rasho/Downloads/best.pt").exists():
+            yolo_model = YOLO("/Users/rasho/Downloads/best.pt")
+            print("YOLOv8n (drone-finetuned) loaded for CPU inference")
         else:
             yolo_model = YOLO("yolov8n.pt")
             print("WARNING: Fine-tuned model not found, using stock YOLOv8n (no drone class)")
 
-    # --- Load COCO labels ---
+    # --- Load labels ---
     labels = []
+    video_single_class = False
     if video_mode:
-        # YOLOv8n uses standard COCO names — load from the model
-        labels = yolo_model.names  # dict {0: 'person', 1: 'bicycle', ...}
+        labels = yolo_model.names  # dict {0: 'drone'} for nc=1, or COCO dict
+        video_single_class = len(yolo_model.names) == 1
     elif CONFIG_PATH.exists():
         labels = load_coco_labels()
         print(f"Loaded {len(labels)} COCO class labels")
@@ -710,7 +719,8 @@ def main():
 
     # --- Kalman fusion tracker ---
     from kalman_fusion import MultiDroneTracker
-    scorer = DroneScorer()
+    is_single_class = USE_V8 or (video_mode and video_single_class)
+    scorer = DroneScorer(single_class=is_single_class)
     dt = 1.0 / (video_fps if video_mode else 30.0)
     fusion_tracker = MultiDroneTracker(dt=dt, confirm_frames=5)
 

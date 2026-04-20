@@ -48,6 +48,17 @@ log/
 # Large model archives
 yolov6n_coco_rvc2.tar.xz
 
+# Training datasets (too large for git)
+training/datasets/
+training/runs/
+
+# Downloaded datasets
+drone_dataset.zip
+drone_dataset_v2.zip
+
+# Stock pretrained weights
+yolov8n.pt
+
 # Separate git repos (cloned from upstream)
 depthai/
 depthai-python/
