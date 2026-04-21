@@ -645,17 +645,25 @@ def main():
         print(f"Video: {args.video} ({total_frames} frames @ {video_fps:.0f}fps)")
         # Prefer fine-tuned model (drone class), fall back to stock COCO
         FINETUNED_PT = SCRIPT_DIR / "training" / "runs" / "drone_phase2" / "weights" / "best.pt"
-        DOWNLOADED_PT = Path("/Users/rasho/Downloads/best (1).pt")
+        # Check for newest fine-tuned weights first
+        DOWNLOAD_CANDIDATES = [
+            Path("/Users/rasho/Downloads/best (2).pt"),
+            Path("/Users/rasho/Downloads/best (1).pt"),
+            Path("/Users/rasho/Downloads/best.pt"),
+        ]
+        loaded = False
         if FINETUNED_PT.exists():
             yolo_model = YOLO(str(FINETUNED_PT))
             print("YOLOv8n (drone-finetuned) loaded for CPU inference")
-        elif DOWNLOADED_PT.exists():
-            yolo_model = YOLO(str(DOWNLOADED_PT))
-            print("YOLOv8n (drone-finetuned) loaded for CPU inference")
-        elif Path("/Users/rasho/Downloads/best.pt").exists():
-            yolo_model = YOLO("/Users/rasho/Downloads/best.pt")
-            print("YOLOv8n (drone-finetuned) loaded for CPU inference")
+            loaded = True
         else:
+            for pt in DOWNLOAD_CANDIDATES:
+                if pt.exists():
+                    yolo_model = YOLO(str(pt))
+                    print(f"YOLOv8n loaded from {pt.name} for CPU inference")
+                    loaded = True
+                    break
+        if not loaded:
             yolo_model = YOLO("yolov8n.pt")
             print("WARNING: Fine-tuned model not found, using stock YOLOv8n (no drone class)")
 
