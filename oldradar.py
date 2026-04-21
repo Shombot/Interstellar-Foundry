@@ -32,6 +32,8 @@ WANT_CLASSES = {
     "airplane", "bird", "surfboard", "cell phone",
     "mouse", "snowboard", "skateboard", "remote",
 }
+TRACK_TTL_SEC = 0.5             # keep a box alive this long after the last YOLO hit
+TRACK_IOU_MATCH = 0.3           # min IoU to treat a new detection as the same track
 
 os.environ.setdefault(
     "DEPTHAI_ZOO_CACHE_PATH",
@@ -222,6 +224,17 @@ class TiMmwRadarReader(threading.Thread):
         return pts, frames, status
 
 
+def _iou(b1, b2):
+    """IoU of two (x1, y1, x2, y2) axis-aligned boxes."""
+    ix1 = max(b1[0], b2[0]); iy1 = max(b1[1], b2[1])
+    ix2 = min(b1[2], b2[2]); iy2 = min(b1[3], b2[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    a1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+    a2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+    union = a1 + a2 - inter
+    return inter / union if union > 0 else 0.0
+
+
 def draw_radar_panel(height, points, status, frames, max_range=RADAR_MAX_RANGE_M):
     """Render a top-down PPI view matching the camera frame's height."""
     w = RADAR_PANEL_W
@@ -325,6 +338,8 @@ def main():
         last_t = time.monotonic()
         fps_ema = 0.0
         shape_logged = False
+        tracks = []                               # [{bbox, cls, conf, last_seen}]
+        next_track_id = 0
 
         try:
             while pipeline.isRunning():
@@ -339,7 +354,10 @@ def main():
                     print(f"Camera frame shape: {frame.shape} (h={h}, w={w})")
                     shape_logged = True
 
-                best_det = None                   # (cls, conf, cx_norm, cy_norm)
+                now = time.monotonic()
+
+                # Collect this frame's flying-object candidates (no drawing yet).
+                frame_dets = []
                 for det in dets.detections:
                     cls_id = int(det.label)
                     cls_name = (
@@ -347,14 +365,44 @@ def main():
                     ).lower()
                     if cls_name not in WANT_CLASSES:
                         continue
+                    bbox = (
+                        int(det.xmin * w), int(det.ymin * h),
+                        int(det.xmax * w), int(det.ymax * h),
+                    )
+                    frame_dets.append((bbox, cls_name, float(det.confidence)))
 
-                    x1 = int(det.xmin * w)
-                    y1 = int(det.ymin * h)
-                    x2 = int(det.xmax * w)
-                    y2 = int(det.ymax * h)
+                # Match each detection to the best existing track by IoU. Track
+                # that matches → update. Unmatched detection → new track.
+                used_track_idxs = set()
+                for bbox, cls_name, conf in frame_dets:
+                    best_i, best_iou = -1, TRACK_IOU_MATCH
+                    for i, tr in enumerate(tracks):
+                        if i in used_track_idxs:
+                            continue
+                        score = _iou(bbox, tr["bbox"])
+                        if score > best_iou:
+                            best_iou, best_i = score, i
+                    if best_i >= 0:
+                        tracks[best_i].update(
+                            bbox=bbox, cls=cls_name, conf=conf, last_seen=now
+                        )
+                        used_track_idxs.add(best_i)
+                    else:
+                        tracks.append({
+                            "id": next_track_id, "bbox": bbox, "cls": cls_name,
+                            "conf": conf, "last_seen": now,
+                        })
+                        next_track_id += 1
 
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    label = f"{cls_name} {det.confidence:.2f}"
+                # Drop expired tracks, draw the survivors in red.
+                tracks = [t for t in tracks if now - t["last_seen"] <= TRACK_TTL_SEC]
+                best_det = None                   # (cls, conf, cx_norm, cy_norm)
+                for tr in tracks:
+                    x1, y1, x2, y2 = tr["bbox"]
+                    fresh = (now - tr["last_seen"]) < 0.05
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                    tag = "LOCK" if fresh else "HOLD"
+                    label = f"{tag} {tr['cls']} {tr['conf']:.2f}"
                     (tw, th), baseline = cv2.getTextSize(
                         label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
                     )
@@ -362,19 +410,17 @@ def main():
                         frame,
                         (x1, y1 - th - baseline - 4),
                         (x1 + tw + 4, y1),
-                        (0, 255, 0), -1,
+                        (0, 0, 255), -1,
                     )
                     cv2.putText(
                         frame, label, (x1 + 2, y1 - baseline - 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2,
                     )
+                    cx_norm = (x1 + x2) / (2 * w)
+                    cy_norm = (y1 + y2) / (2 * h)
+                    if best_det is None or tr["conf"] > best_det[1]:
+                        best_det = (tr["cls"], tr["conf"], cx_norm, cy_norm)
 
-                    cx_norm = (det.xmin + det.xmax) / 2
-                    cy_norm = (det.ymin + det.ymax) / 2
-                    if best_det is None or det.confidence > best_det[1]:
-                        best_det = (cls_name, det.confidence, cx_norm, cy_norm)
-
-                now = time.monotonic()
                 dt = now - last_t
                 last_t = now
                 if dt > 0:
