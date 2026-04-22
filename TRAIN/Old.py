@@ -1,9 +1,10 @@
 """
 Live Drone Detection on Oak-D S2
-Runs a fine-tuned YOLOv8 model on the camera's on-board Myriad X VPU.
-The Jetson only draws boxes, so FPS is limited by the camera/NN, not the host.
+Runs YOLOv6-nano on the camera's on-board Myriad X VPU. The Jetson only
+draws boxes, so FPS is limited by the camera/NN, not the host CPU.
 
-Model: local OpenVINO blob compiled for RVC2 (6 shaves), anchor-free YOLOv8 head.
+Model: YOLOv6-nano (COCO) pulled from the DepthAI zoo on first run and cached.
+The DEPTHAI_ZOO_CACHE_PATH env var controls where the cache lives.
 """
 import os
 import time
@@ -13,47 +14,33 @@ import cv2
 import depthai as dai
 
 # ---------- Configuration ----------
-BLOB_PATH = Path(__file__).parent / "best_openvino_2022.1_6shave.blob"
-NN_INPUT_SIZE = (512, 288)        # Must match blob input (w, h)
-NUM_CLASSES = 1                   # Fine-tuned drone detector (single class)
-CLASS_NAMES = ["drone"]           # Index-aligned with training dataset
-CONF_THRESHOLD = 0.01
-IOU_THRESHOLD = 0.5
-FPS_TARGET = 30
+MODEL_SLUG = "yolov6-nano"        # DepthAI zoo slug (RVC2 build, COCO-trained)
+CONF_THRESHOLD = 0.25             # Minimum confidence to display a detection
+FPS_TARGET = 30                   # Requested camera/NN fps
+
+# Class names that represent a drone. COCO has "airplane" (class 4) as the
+# closest analog. Leave ACCEPT_CLASSES = None to show every class.
+ACCEPT_CLASSES = None  # e.g. {"airplane", "drone", "uav", "quadcopter"}
+
+# Make sure the zoo cache dir is writable before touching depthai.
+os.environ.setdefault(
+    "DEPTHAI_ZOO_CACHE_PATH",
+    os.path.expanduser("~/.depthai_cache"),
+)
+os.makedirs(os.environ["DEPTHAI_ZOO_CACHE_PATH"], exist_ok=True)
 
 
 def main():
-    if not BLOB_PATH.exists():
-        raise FileNotFoundError(f"Model blob not found: {BLOB_PATH}")
-
-    print(f"Opening Oak-D S2 and loading blob '{BLOB_PATH.name}'...")
+    print(f"Opening Oak-D S2 and loading model '{MODEL_SLUG}' from zoo...")
     with dai.Pipeline() as pipeline:
         cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
-        cam_out = cam.requestOutput(
-            size=NN_INPUT_SIZE,
-            type=dai.ImgFrame.Type.BGR888p,
-            fps=FPS_TARGET,
+
+        model_desc = dai.NNModelDescription(MODEL_SLUG, platform="RVC2")
+        nn = pipeline.create(dai.node.DetectionNetwork).build(
+            cam, model_desc, fps=FPS_TARGET
         )
-
-        nn = pipeline.create(dai.node.DetectionNetwork)
-        nn.setBlobPath(str(BLOB_PATH))
         nn.setConfidenceThreshold(CONF_THRESHOLD)
-        nn.setNumInferenceThreads(2)
-        nn.input.setBlocking(False)
-
-        # YOLO post-processing lives on the underlying parser in DepthAI v3.
-        parser = nn.detectionParser
-        parser.setNNFamily(dai.DetectionNetworkType.YOLO)
-        parser.setSubtype("yolov8")
-        parser.setNumClasses(NUM_CLASSES)
-        parser.setCoordinateSize(4)
-        parser.setAnchors([])           # YOLOv8 is anchor-free
-        parser.setAnchorMasks({})
-        parser.setIouThreshold(IOU_THRESHOLD)
-        parser.setClasses(CLASS_NAMES)
-        parser.setInputImageSize(*NN_INPUT_SIZE)
-
-        cam_out.link(nn.input)
+        class_names = nn.getClasses() or []
 
         det_queue = nn.out.createOutputQueue()
         frame_queue = nn.passthrough.createOutputQueue()
@@ -75,10 +62,18 @@ def main():
 
             for det in dets.detections:
                 cls_id = int(det.label)
-                # print(cls_id)
                 cls_name = (
-                    CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else str(cls_id)
-                )
+                    class_names[cls_id] if cls_id < len(class_names) else str(cls_id)
+                ).lower()
+                if ACCEPT_CLASSES is not None and cls_name not in ACCEPT_CLASSES:
+                    continue
+                
+                want = ["airplane", "bird", "surfboard", "cell phone", "bird", "mouse", "snowboard", "skateboard", "remote"]
+
+                if cls_name not in want:
+                    continue
+                if cls_name == "person":
+                    continue
 
                 x1 = int(det.xmin * w)
                 y1 = int(det.ymin * h)
@@ -125,7 +120,7 @@ def main():
                 2,
             )
 
-            cv2.imshow("Drone Detection (Oak-D on-device YOLOv8)", frame)
+            cv2.imshow("Drone Detection (Oak-D on-device YOLOv6n)", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 

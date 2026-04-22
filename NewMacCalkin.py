@@ -1,11 +1,9 @@
 """
-Live Drone Detection on Oak-D S2
-Runs a fine-tuned YOLOv8 model on the camera's on-board Myriad X VPU.
-The Jetson only draws boxes, so FPS is limited by the camera/NN, not the host.
-
-Model: local OpenVINO blob compiled for RVC2 (6 shaves), anchor-free YOLOv8 head.
+Live Drone Detection on Oak-D S2 (VPU-only)
+Jetson port of the Mac script: fine-tuned YOLO drone detector runs on the
+Oak-D's on-board Myriad X VPU via the precompiled OpenVINO blob. The Jetson
+only receives frames + detections and draws overlays.
 """
-import os
 import time
 from pathlib import Path
 
@@ -13,13 +11,15 @@ import cv2
 import depthai as dai
 
 # ---------- Configuration ----------
-BLOB_PATH = Path(__file__).parent / "best_openvino_2022.1_6shave.blob"
-NN_INPUT_SIZE = (512, 288)        # Must match blob input (w, h)
-NUM_CLASSES = 1                   # Fine-tuned drone detector (single class)
-CLASS_NAMES = ["drone"]           # Index-aligned with training dataset
-CONF_THRESHOLD = 0.01
-IOU_THRESHOLD = 0.5
+BLOB_PATH = Path(__file__).parent / "calkinnewmodel1.blob"
+NN_INPUT_SIZE = (512, 288)        # (w, h) — must match the compiled blob
+NUM_CLASSES = 3
+CLASS_NAMES = ["airplane", "drone", "helicopter"]
+CONF_THRESHOLD = 0.5              # Matches Mac script
+IOU_THRESHOLD = 0.45              # Matches Mac script
 FPS_TARGET = 30
+
+DRONE_CLASS_NAMES = {"airplane", "drone", "uav", "quadcopter"}
 
 
 def main():
@@ -41,17 +41,15 @@ def main():
         nn.setNumInferenceThreads(2)
         nn.input.setBlocking(False)
 
-        # YOLO post-processing lives on the underlying parser in DepthAI v3.
         parser = nn.detectionParser
         parser.setNNFamily(dai.DetectionNetworkType.YOLO)
         parser.setSubtype("yolov8")
         parser.setNumClasses(NUM_CLASSES)
         parser.setCoordinateSize(4)
-        parser.setAnchors([])           # YOLOv8 is anchor-free
+        parser.setAnchors([])
         parser.setAnchorMasks({})
         parser.setIouThreshold(IOU_THRESHOLD)
         parser.setClasses(CLASS_NAMES)
-        parser.setInputImageSize(*NN_INPUT_SIZE)
 
         cam_out.link(nn.input)
 
@@ -59,7 +57,7 @@ def main():
         frame_queue = nn.passthrough.createOutputQueue()
 
         pipeline.start()
-        print("Detection running. Press 'q' to quit.")
+        print("Starting detection. Press 'q' to quit.")
 
         last_t = time.monotonic()
         fps_ema = 0.0
@@ -75,11 +73,11 @@ def main():
 
             for det in dets.detections:
                 cls_id = int(det.label)
-                # print(cls_id)
                 cls_name = (
                     CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else str(cls_id)
-                )
+                ).lower()
 
+                conf = float(det.confidence)
                 x1 = int(det.xmin * w)
                 y1 = int(det.ymin * h)
                 x2 = int(det.xmax * w)
@@ -87,7 +85,7 @@ def main():
 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-                label = f"{cls_name} {det.confidence:.2f}"
+                label = f"DRONE ({cls_name}) {conf:.2f}"
                 (tw, th), baseline = cv2.getTextSize(
                     label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
                 )
@@ -125,7 +123,7 @@ def main():
                 2,
             )
 
-            cv2.imshow("Drone Detection (Oak-D on-device YOLOv8)", frame)
+            cv2.imshow("Drone Detection (Oak-D VPU)", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
