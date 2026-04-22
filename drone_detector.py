@@ -72,28 +72,17 @@ DRONE_THRESHOLD = 0.30
 
 # Model paths
 SCRIPT_DIR = Path(__file__).parent
-BLOB_PATH_V8 = SCRIPT_DIR / "yolov6n_model" / "best_openvino_2022.1_6shave.blob"
-BLOB_PATH_V6 = SCRIPT_DIR / "yolov6n_model" / "yolov6n-r2-288x512_openvino_2022.1_6shave.blob"
-BLOB_PATH = BLOB_PATH_V8 if BLOB_PATH_V8.exists() else BLOB_PATH_V6
-ARCHIVE_PATH = SCRIPT_DIR / "yolov6n_coco_rvc2.tar.xz"
+BLOB_PATH = SCRIPT_DIR / "yolov6n_model" / "drone_v3.blob"
 CONFIG_PATH = SCRIPT_DIR / "yolov6n_model" / "config.json"
-USE_V8 = BLOB_PATH == BLOB_PATH_V8
 
-# nc=1 for fine-tuned drone model, 80 COCO classes for V6 fallback
-NUM_CLASSES = 1 if USE_V8 else 80
+# Single-class drone detector (nc=1, class 0 = drone)
+NUM_CLASSES = 1
 CONF_THRESHOLD = 0.50
 IOU_THRESHOLD = 0.45
 
-# COCO classes that are airborne / could be a drone (V6 fallback only)
-FLYING_CLASSES = {0} if USE_V8 else {4, 14, 29, 33}
-
 
 def load_coco_labels():
-    if USE_V8:
-        return ["drone"]
-    with open(CONFIG_PATH) as f:
-        cfg = json.load(f)
-    return cfg['model']['heads'][0]['metadata']['classes']
+    return ["drone"]
 
 
 def parse_yolov8_raw(nn_data):
@@ -152,28 +141,11 @@ def parse_yolov8_raw(nn_data):
 # Camera-only drone scorer
 # ---------------------------------------------------------------------------
 class DroneScorer:
-    def __init__(self, single_class=False):
-        self.single_class = single_class
-
     def score(self, yolo_label, yolo_conf, depth_m):
-        if self.single_class:
-            # nc=1 model: class 0 = drone, the only possible class
-            if yolo_label == 0:
-                return min(0.95, 0.7 + yolo_conf * 0.25), f"drone {yolo_conf:.0%}"
-            return 0.0, "unknown"
-        # V6 fallback: COCO proxy scoring
-        if yolo_label is not None and yolo_label not in FLYING_CLASSES:
-            return 0.0, "ground-obj"
-        if yolo_label == 14:
-            return 0.25, f"bird {yolo_conf:.0%}"
-        if yolo_label == 4:
-            score = 0.65 if yolo_conf < 0.5 else 0.50
-            return score, "airplane-like"
-        if yolo_label in (29, 33):
-            return 0.40, "airborne-obj"
-        if yolo_label is None:
-            return 0.35, "unidentified"
-        return 0.0, "low-evidence"
+        # nc=1: class 0 = drone, the only possible class
+        if yolo_label == 0:
+            return min(0.95, 0.7 + yolo_conf * 0.25), f"drone {yolo_conf:.0%}"
+        return 0.0, "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -260,9 +232,9 @@ def draw_camera_yolo_boxes(frame, yolo_detections, labels, depth_frame,
             lbl_name = labels[lbl_idx] if lbl_idx < len(labels) else "?"
         conf = det.confidence
 
-        in_flying = lbl_idx in FLYING_CLASSES
-        color = CYAN if in_flying else (100, 100, 100)
-        tag = "DET" if in_flying else ""
+        # Single-class drone model: all detections are drones
+        color = CYAN
+        tag = "DET"
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
         label = f"{tag} {lbl_name} {conf:.0%}" if tag else f"{lbl_name} {conf:.0%}"
@@ -561,22 +533,9 @@ def build_oak_pipeline():
     rgbQ = rgbOut.createOutputQueue(maxSize=1, blocking=False)
     depthQ = stereo.depth.createOutputQueue(maxSize=1, blocking=False)
 
-    if USE_V8:
-        # YOLOv8 — raw NN output, parse on host
-        nnQ = nn.out.createOutputQueue(maxSize=1, blocking=False)
-        return pipeline, rgbQ, depthQ, nnQ
-    else:
-        # YOLOv6 — use DetectionParser with NNArchive
-        parser = pipeline.create(dai.node.DetectionParser)
-        parser.setNNArchive(dai.NNArchive(str(ARCHIVE_PATH)))
-        parser.setConfidenceThreshold(0.15)
-        parser.setInputImageSize(NN_W, NN_H)
-        parser.setRunOnHost(True)
-        nn.out.link(parser.input)
-        detQ = parser.out.createOutputQueue(maxSize=1, blocking=False)
-        return pipeline, rgbQ, depthQ, detQ
-
-    return pipeline, rgbQ, depthQ, detQ
+    # YOLOv8 raw NN output, parsed on host via parse_yolov8_raw()
+    nnQ = nn.out.createOutputQueue(maxSize=1, blocking=False)
+    return pipeline, rgbQ, depthQ, nnQ
 
 
 def build_oak_pipeline_no_nn():
@@ -647,6 +606,7 @@ def main():
         FINETUNED_PT = SCRIPT_DIR / "training" / "runs" / "drone_phase2" / "weights" / "best.pt"
         # Check for newest fine-tuned weights first
         DOWNLOAD_CANDIDATES = [
+            Path("/Users/rasho/Downloads/best (3).pt"),
             Path("/Users/rasho/Downloads/best (2).pt"),
             Path("/Users/rasho/Downloads/best (1).pt"),
             Path("/Users/rasho/Downloads/best.pt"),
@@ -668,14 +628,10 @@ def main():
             print("WARNING: Fine-tuned model not found, using stock YOLOv8n (no drone class)")
 
     # --- Load labels ---
-    labels = []
-    video_single_class = False
     if video_mode:
-        labels = yolo_model.names  # dict {0: 'drone'} for nc=1, or COCO dict
-        video_single_class = len(yolo_model.names) == 1
-    elif CONFIG_PATH.exists():
+        labels = yolo_model.names  # dict {0: 'drone'}
+    else:
         labels = load_coco_labels()
-        print(f"Loaded {len(labels)} COCO class labels")
 
     # --- Initialize hardware sensors (skip in video mode) ---
     doppler = None
@@ -697,14 +653,10 @@ def main():
 
         if not args.no_camera:
             try:
-                if USE_V8 and BLOB_PATH.exists():
+                if BLOB_PATH.exists():
                     pipeline, rgbQ, depthQ, detQ = build_oak_pipeline()
                     has_nn = True
-                    print("OAK camera + YOLOv8n (drone-finetuned) on Myriad X VPU")
-                elif BLOB_PATH.exists() and ARCHIVE_PATH.exists():
-                    pipeline, rgbQ, depthQ, detQ = build_oak_pipeline()
-                    has_nn = True
-                    print("OAK camera + YOLOv6n on Myriad X VPU")
+                    print("OAK camera + YOLOv8n drone detector on Myriad X VPU")
                 else:
                     pipeline, rgbQ, depthQ, detQ = build_oak_pipeline_no_nn()
                     print("OAK camera (no YOLO blob -- depth-only mode)")
@@ -727,8 +679,7 @@ def main():
 
     # --- Kalman fusion tracker ---
     from kalman_fusion import MultiDroneTracker
-    is_single_class = USE_V8 or (video_mode and video_single_class)
-    scorer = DroneScorer(single_class=is_single_class)
+    scorer = DroneScorer()
     dt = 1.0 / (video_fps if video_mode else 30.0)
     fusion_tracker = MultiDroneTracker(dt=dt, confirm_frames=5)
 
@@ -798,10 +749,7 @@ def main():
                         if detQ is not None:
                             det_msg = detQ.tryGet()
                             if det_msg is not None:
-                                if USE_V8:
-                                    yolo_detections = parse_yolov8_raw(det_msg)
-                                else:
-                                    yolo_detections = det_msg.detections
+                                yolo_detections = parse_yolov8_raw(det_msg)
                     except Exception:
                         pass
 
