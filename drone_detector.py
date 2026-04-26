@@ -61,7 +61,7 @@ RADAR_CLI_BAUD = 115200
 RADAR_DATA_BAUD = 921600
 RADAR_CONFIG_FILE = os.environ.get(
     "RADAR_CONFIG_FILE",
-    os.path.expanduser("~/iwr6843aop_drone.cfg"),
+    str(Path(__file__).parent / "radar_profile.cfg"),
 )
 RADAR_MAX_RANGE_M = 10.0        # horizon of the PPI plot — finer pixels at close range
 RADAR_PANEL_W = 480             # pixels — width of the radar side panel
