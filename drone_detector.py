@@ -63,7 +63,7 @@ RADAR_CONFIG_FILE = os.environ.get(
     "RADAR_CONFIG_FILE",
     os.path.expanduser("~/iwr6843aop_drone.cfg"),
 )
-RADAR_MAX_RANGE_M = 15.0        # horizon of the PPI plot
+RADAR_MAX_RANGE_M = 10.0        # horizon of the PPI plot — finer pixels at close range
 RADAR_PANEL_W = 480             # pixels — width of the radar side panel
 # TI mmWave demo wire format
 MAGIC_WORD = b"\x02\x01\x04\x03\x06\x05\x08\x07"
@@ -586,24 +586,20 @@ def main():
 
                 now = time.monotonic()
 
-                # 3-class blob (airplane / drone / helicopter). When
-                # DRONE_LABEL is None we accept every class — the close-range
-                # drone view often gets labelled airplane / helicopter, so
-                # filtering strictly to label==1 was hiding real targets.
+                # 3-class blob (airplane / drone / helicopter). DRONE_LABEL
+                # is None so we accept every class — Calkin's model often
+                # mislabels a close drone as airplane or helicopter, but for
+                # the dashboard they all collapse to a single "drone" tag.
                 frame_dets = []
                 for det in latest_dets:
                     if DRONE_LABEL is not None and det["label"] != DRONE_LABEL:
                         continue
-                    cls_idx = int(det["label"])
-                    cls_name = (CLASS_NAMES[cls_idx]
-                                if 0 <= cls_idx < len(CLASS_NAMES)
-                                else f"cls{cls_idx}")
                     bbox = (
                         int(det["xmin"] * w), int(det["ymin"] * h),
                         int(det["xmax"] * w), int(det["ymax"] * h),
                     )
                     dist_m = _sample_depth_m(latest_depth_mm, bbox, w, h)
-                    frame_dets.append((bbox, cls_name, det["confidence"], dist_m))
+                    frame_dets.append((bbox, "drone", det["confidence"], dist_m))
 
                 # Match each detection against each track's PREDICTED bbox (so a
                 # moving drone that YOLO briefly lost can still re-associate even
