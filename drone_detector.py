@@ -2,9 +2,9 @@
 Live Drone Detection Dashboard: Oak-D S2 camera + TI IWR6843AOPEVM mmWave radar.
 
 Same dashboard as oldradar.py — left half is the Oak-D RGB feed with detection
-overlays, right half is the TI radar PPI plot — but the YOLO model is Rashod's
-fine-tuned single-class drone blob (rashodnewmodel.blob) running on the Myriad
-X VPU instead of the generic 80-class yolov6-nano from the depthai zoo.
+overlays, right half is the TI radar PPI plot — but the YOLO model is Calkin's
+fine-tuned 3-class blob (calkinmodel_v2.blob) running on the Myriad X VPU
+instead of the generic 80-class yolov6-nano from the depthai zoo.
 
 Inference uses dai.node.NeuralNetwork (raw output) + manual YOLOv8 parsing on
 host, mirroring the pipeline that was validated on rashod-testing. The
@@ -27,14 +27,14 @@ except ImportError:
 import depthai as dai
 
 # ---------- Camera / detector config ----------
-BLOB_PATH = Path(__file__).parent / "rashodnewmodel_v2.blob"
+BLOB_PATH = Path(__file__).parent / "calkinmodel_v2.blob"
 # Display + stereo depth size. 16:9 to match NN_W:NN_H — keeps both outputs
 # from the same center-cropped 16:9 strip of the IMX378 sensor, so bboxes
 # from NN coords map cleanly to display coords (no aspect distortion / no
 # hidden top-bottom crop that hides the drone from the NN).
 MAIN_W, MAIN_H = 640, 360
 NN_W, NN_H = 512, 288             # NN input size — must match the compiled blob
-# rashodnewmodel_v2.blob = Calkin's 3-class best.pt (airplane/drone/helicopter)
+# calkinmodel_v2.blob = Calkin's 3-class best.pt (airplane/drone/helicopter)
 # recompiled with /255 normalization baked into MO. Empirically this checkpoint
 # detects drones much more reliably than the single-class drone_v3.pt — that
 # model was undertrained for the deployment scene. Drone is class index 1.

@@ -1,19 +1,20 @@
 """
 Re-export best.pt → ONNX → MyriadX blob with /255 normalization baked in.
 
-The repo's rashodnewmodel.blob behaves as if input normalization was never
-compiled in: on hardware, class scores saturate around 0 (peak ~0.004-0.05
-on a clearly-visible drone vs. ~0.95 expected). Ultralytics' ONNX export
-does not bake /255 into the graph, so we must pass --scale_values to MO at
-blob compile time.
+The repo's original drone_v3.blob (a.k.a. rashodnewmodel.blob) behaved as if
+input normalization was never compiled in: on hardware, class scores
+saturated around 0 (peak ~0.004 vs. ~0.95 expected). Ultralytics' ONNX
+export does not bake /255 into the graph, so we must pass --scale_values
+to OpenVINO MO at blob compile time.
 
 This script:
-  1. Loads best.pt and exports to ONNX at the deployment input shape.
+  1. Loads best.pt (Calkin's 3-class airplane/drone/helicopter checkpoint)
+     and exports to ONNX at the deployment input shape.
   2. Calls blobconverter.from_onnx() with explicit mean/scale arguments so
      the resulting blob includes a /255 preprocessing layer the MyriadX
      runtime actually executes.
 
-Output: rashodnewmodel_v2.blob (or whatever you set OUT_BLOB to).
+Output: calkinmodel_v2.blob (or whatever you set OUT_BLOB to).
 
 Usage:
     python3 reexport_blob.py
@@ -64,8 +65,8 @@ def _disable_ssl_verify_for_requests():
 _disable_ssl_verify_for_requests()
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-WEIGHTS = SCRIPT_DIR / "drone_v3.pt"
-OUT_BLOB = SCRIPT_DIR / "drone_v3_v2.blob"
+WEIGHTS = SCRIPT_DIR / "best.pt"
+OUT_BLOB = SCRIPT_DIR / "calkinmodel_v2.blob"
 
 # Deployment input — must match drone_detector.py's NN_W, NN_H.
 NN_W, NN_H = 512, 288
