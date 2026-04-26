@@ -5,6 +5,10 @@ Same dashboard as oldradar.py — left half is the Oak-D RGB feed with detection
 overlays, right half is the TI radar PPI plot — but the YOLO model is Rashod's
 fine-tuned single-class drone blob (rashodnewmodel.blob) running on the Myriad
 X VPU instead of the generic 80-class yolov6-nano from the depthai zoo.
+
+Inference uses dai.node.NeuralNetwork (raw output) + manual YOLOv8 parsing on
+host, mirroring the pipeline that was validated on rashod-testing. The
+DetectionNetwork built-in parser path produced 0 detections for this blob.
 """
 import os
 import struct
@@ -23,16 +27,29 @@ except ImportError:
 import depthai as dai
 
 # ---------- Camera / detector config ----------
-BLOB_PATH = Path(__file__).parent / "rashodnewmodel.blob"
-NN_INPUT_SIZE = (512, 288)        # (w, h) — must match the compiled blob
-NUM_CLASSES = 1
-CLASS_NAMES = ["drone"]
-CONF_THRESHOLD = 0.25
+BLOB_PATH = Path(__file__).parent / "rashodnewmodel_v2.blob"
+# Display + stereo depth size. 16:9 to match NN_W:NN_H — keeps both outputs
+# from the same center-cropped 16:9 strip of the IMX378 sensor, so bboxes
+# from NN coords map cleanly to display coords (no aspect distortion / no
+# hidden top-bottom crop that hides the drone from the NN).
+MAIN_W, MAIN_H = 640, 360
+NN_W, NN_H = 512, 288             # NN input size — must match the compiled blob
+# rashodnewmodel_v2.blob = Calkin's 3-class best.pt (airplane/drone/helicopter)
+# recompiled with /255 normalization baked into MO. Empirically this checkpoint
+# detects drones much more reliably than the single-class drone_v3.pt — that
+# model was undertrained for the deployment scene. Drone is class index 1.
+NUM_CLASSES = 3
+CLASS_NAMES = ["airplane", "drone", "helicopter"]
+# Accept all three classes as targets — Calkin's training set is small enough
+# that close-range / hand-held views often classify the drone as airplane or
+# helicopter. Set DRONE_LABEL back to 1 if you only want strict drone hits.
+DRONE_LABEL = None
+CONF_THRESHOLD = 0.50      # real targets score 0.7+; 0.5 kills the 0.3–0.5 noise
 IOU_THRESHOLD = 0.45
 FPS_TARGET = 30
-TRACK_TTL_SEC = 0.7            # keep a box alive this long after the last YOLO hit
+TRACK_TTL_SEC = 0.25           # short — one-frame false positives die fast
 TRACK_IOU_MATCH = 0.25          # min IoU (against predicted bbox) to re-associate
-TRACK_MAX_EXTRAP_SEC = 0.75     # cap motion extrapolation to avoid runaway drift
+TRACK_MAX_EXTRAP_SEC = 0.15     # minimal motion extrapolation: no sliding ghosts
 TRACK_VEL_EMA = 0.5            # EMA weight on newest velocity estimate
 
 # ---------- TI IWR6843AOPEVM config ----------
@@ -216,6 +233,146 @@ class TiMmwRadarReader(threading.Thread):
         return pts, frames, status
 
 
+_NN_INTROSPECT_DONE = False
+_NN_PARSE_DIAG_COUNT = 0
+_NN_RUNNING_MAX_SCORE = 0.0
+_NN_LAST_DIAG_T = 0.0
+
+
+def _get_raw_tensor(nn_data):
+    """DepthAI 3.x removed getFirstLayerFp16(); raw output now comes from
+    getTensor(name). Walk through whatever introspection methods this dai
+    build exposes so we don't hard-code a single API."""
+    global _NN_INTROSPECT_DONE
+
+    # First-call diagnostic: log every layer name + shape so we can confirm
+    # what the blob is actually emitting (yolov8 single-output vs. yolov6r2
+    # multi-head, FP16 vs FP32, etc.).
+    if not _NN_INTROSPECT_DONE:
+        _NN_INTROSPECT_DONE = True
+        for getter in ("getAllLayerNames", "getAllLayers"):
+            if hasattr(nn_data, getter):
+                try:
+                    layers = getattr(nn_data, getter)()
+                    print(f"[NN introspect] {getter}() -> {layers}")
+                    break
+                except Exception as e:
+                    print(f"[NN introspect] {getter}() failed: {e}")
+
+    # Preferred path on DepthAI 3.x: getTensor(name) returns a numpy array.
+    if hasattr(nn_data, "getTensor"):
+        # Try common ONNX/Ultralytics YOLOv8 output names first.
+        for name in ("output0", "output", "outputs"):
+            try:
+                arr = nn_data.getTensor(name)
+                if arr is not None:
+                    return np.array(arr)
+            except Exception:
+                pass
+        # Fall back to whatever layer name the blob actually exposes.
+        for getter in ("getAllLayerNames", "getAllLayers"):
+            if hasattr(nn_data, getter):
+                try:
+                    layers = getattr(nn_data, getter)()
+                    if layers:
+                        first = layers[0]
+                        # getAllLayers() may return objects with .name; getAllLayerNames() returns strings.
+                        name = first if isinstance(first, str) else getattr(first, "name", None)
+                        if name:
+                            return np.array(nn_data.getTensor(name))
+                except Exception:
+                    pass
+
+    # Legacy DepthAI 2.x path.
+    if hasattr(nn_data, "getFirstLayerFp16"):
+        return np.array(nn_data.getFirstLayerFp16())
+
+    raise AttributeError(
+        "NNData has no recognised method to extract raw tensor — "
+        f"available attrs include: {[a for a in dir(nn_data) if not a.startswith('_')][:20]}"
+    )
+
+
+def parse_yolov8_raw(nn_data, conf_thresh=CONF_THRESHOLD, iou_thresh=IOU_THRESHOLD):
+    """Parse raw YOLOv8 NN output into a list of detection dicts.
+
+    For nc=1: output shape (1, 5, N) where 5 = 4 bbox + 1 class score.
+    Returns list of dicts with normalized xmin/ymin/xmax/ymax + confidence + label.
+    Mirrors the validated parser on rashod-testing, but uses DepthAI 3.x
+    getTensor() instead of the removed getFirstLayerFp16().
+    """
+    raw = _get_raw_tensor(nn_data).astype(np.float32, copy=False).ravel()
+    output = raw.reshape(NUM_CLASSES + 4, -1).T
+    boxes = output[:, :4]
+    scores = output[:, 4:]
+
+    # Diagnostic: log distribution. First few parses print full detail;
+    # after that, print a running max-score every ~1s so we can see if the
+    # model ever produces real detections (vs. always-zero) — the previous
+    # diagnostic only fired on startup before the camera + scene were warm.
+    global _NN_PARSE_DIAG_COUNT, _NN_RUNNING_MAX_SCORE, _NN_LAST_DIAG_T
+    s = scores.ravel()
+    cur_max = float(s.max()) if s.size else 0.0
+    _NN_RUNNING_MAX_SCORE = max(_NN_RUNNING_MAX_SCORE, cur_max)
+    _NN_PARSE_DIAG_COUNT += 1
+    if _NN_PARSE_DIAG_COUNT <= 3:
+        b = boxes
+        print(
+            f"[NN parse #{_NN_PARSE_DIAG_COUNT}] raw.size={raw.size} "
+            f"output.shape={output.shape} | "
+            f"raw min={raw.min():.6g} max={raw.max():.6g} | "
+            f"score min={s.min():.6g} max={s.max():.6g} mean={s.mean():.6g} | "
+            f"xywh max={b.max(axis=0)} mean={b.mean(axis=0)}"
+        )
+    else:
+        now = time.monotonic()
+        if now - _NN_LAST_DIAG_T > 1.0:
+            _NN_LAST_DIAG_T = now
+            print(
+                f"[NN running] max_score_seen={_NN_RUNNING_MAX_SCORE:.4f} "
+                f"this_frame_max={cur_max:.4f} "
+                f"frames={_NN_PARSE_DIAG_COUNT}"
+            )
+
+    class_ids = np.argmax(scores, axis=1)
+    confidences = scores[np.arange(len(scores)), class_ids]
+
+    mask = confidences > conf_thresh
+    boxes = boxes[mask]
+    confidences = confidences[mask]
+    class_ids = class_ids[mask]
+    if len(boxes) == 0:
+        return []
+
+    # xywh → xyxy, normalized by NN input size
+    x, y, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    x1 = (x - w / 2) / NN_W
+    y1 = (y - h / 2) / NN_H
+    x2 = (x + w / 2) / NN_W
+    y2 = (y + h / 2) / NN_H
+
+    indices = cv2.dnn.NMSBoxes(
+        bboxes=list(zip(x1, y1, x2 - x1, y2 - y1)),
+        scores=confidences.tolist(),
+        score_threshold=conf_thresh,
+        nms_threshold=iou_thresh,
+    )
+    if len(indices) == 0:
+        return []
+
+    detections = []
+    for i in np.array(indices).flatten():
+        detections.append({
+            "xmin": float(np.clip(x1[i], 0, 1)),
+            "ymin": float(np.clip(y1[i], 0, 1)),
+            "xmax": float(np.clip(x2[i], 0, 1)),
+            "ymax": float(np.clip(y2[i], 0, 1)),
+            "confidence": float(confidences[i]),
+            "label": int(class_ids[i]),
+        })
+    return detections
+
+
 def _iou(b1, b2):
     """IoU of two (x1, y1, x2, y2) axis-aligned boxes."""
     ix1 = max(b1[0], b2[0]); iy1 = max(b1[1], b2[1])
@@ -239,12 +396,7 @@ def _predict_bbox(tr, now):
 
 
 def _sample_depth_m(depth_mm, bbox, frame_w, frame_h, win=5):
-    """Median depth (m) in a small window at the bbox center; 0 if invalid.
-
-    The depth map is aligned to CAM_A but usually at a different resolution
-    than the NN passthrough frame. Both share CAM_A's FOV, so we map the
-    bbox center via normalized coords.
-    """
+    """Median depth (m) in a small window at the bbox center; 0 if invalid."""
     if depth_mm is None or frame_w <= 0 or frame_h <= 0:
         return 0.0
     dh, dw = depth_mm.shape
@@ -344,40 +496,17 @@ def main():
 
     print(f"Opening Oak-D S2 and loading blob '{BLOB_PATH.name}'...")
     with dai.Pipeline() as pipeline:
+        # Single RGB output at NN input size — wired directly to the NN.
+        # We display nn.passthrough below, so detections and the displayed
+        # frame come from the same NN execution (no async drift between
+        # bbox positions and what the user sees).
         cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
-        cam_out = cam.requestOutput(
-            size=NN_INPUT_SIZE,
-            type=dai.ImgFrame.Type.RGB888p,
-            fps=FPS_TARGET,
+        nn_in_out = cam.requestOutput(
+            (NN_W, NN_H), dai.ImgFrame.Type.RGB888p, fps=FPS_TARGET
         )
 
-        # Local trained single-class drone blob — same VPU pipeline, just a
-        # different model (and parser config) than oldradar.py's zoo model.
-        nn = pipeline.create(dai.node.DetectionNetwork)
-        nn.setBlobPath(str(BLOB_PATH))
-        nn.setConfidenceThreshold(CONF_THRESHOLD)
-        nn.setNumInferenceThreads(2)
-        nn.input.setBlocking(False)
-
-        parser = nn.detectionParser
-        parser.setNNFamily(dai.DetectionNetworkType.YOLO)
-        parser.setSubtype("yolov8")
-        parser.setNumClasses(NUM_CLASSES)
-        parser.setCoordinateSize(4)
-        parser.setAnchors([])
-        parser.setAnchorMasks({})
-        parser.setIouThreshold(IOU_THRESHOLD)
-        parser.setClasses(CLASS_NAMES)
-
-        cam_out.link(nn.input)
-
-        det_queue = nn.out.createOutputQueue()
-        frame_queue = nn.passthrough.createOutputQueue()
-
-        # Stereo depth for per-detection distance. Both mono cameras feed a
-        # StereoDepth node aligned to CAM_A so depth samples share the RGB
-        # FOV — a detection's normalized bbox coords map directly into the
-        # depth map regardless of its resolution.
+        # Stereo depth aligned to CAM_A at MAIN_W×MAIN_H so bbox coords map
+        # directly into the depth map without rescaling.
         left_cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
         left_out = left_cam.requestOutput((640, 400), dai.ImgFrame.Type.GRAY8, fps=FPS_TARGET)
         right_cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
@@ -388,17 +517,32 @@ def main():
         stereo.setLeftRightCheck(True)
         stereo.setSubpixel(True)
         stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
-        stereo.setOutputSize(640, 400)
+        stereo.setOutputSize(MAIN_W, MAIN_H)
         left_out.link(stereo.left)
         right_out.link(stereo.right)
+
+        # Raw NN — host parses output via parse_yolov8_raw().
+        # Camera RGB888p output is wired straight in; no ImageManip in
+        # the inference path so the blob actually receives RGB planes.
+        nn = pipeline.create(dai.node.NeuralNetwork)
+        nn.setBlobPath(str(BLOB_PATH))
+        nn.setNumInferenceThreads(2)
+        nn_in_out.link(nn.input)
+
+        # Display from nn.passthrough — the exact frame the NN ran on, so
+        # bboxes (also from this NN execution) overlay perfectly. Blocking
+        # get() on both pairs them up automatically.
+        img_queue = nn.passthrough.createOutputQueue(maxSize=1, blocking=False)
         depth_queue = stereo.depth.createOutputQueue(maxSize=1, blocking=False)
+        nn_queue = nn.out.createOutputQueue(maxSize=1, blocking=False)
 
         pipeline.start()
-        print("Detection running. Press 'q' to quit.")
+        print(f"Detection running. conf>{CONF_THRESHOLD} iou>{IOU_THRESHOLD}. "
+              f"Press 'q' to quit.")
 
         win_name = "Drone Dashboard — Oak-D + TI mmWave (Rashod model)"
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win_name, 1280, 480)
+        cv2.resizeWindow(win_name, MAIN_W + RADAR_PANEL_W, MAIN_H)
 
         last_t = time.monotonic()
         fps_ema = 0.0
@@ -409,36 +553,57 @@ def main():
 
         try:
             while pipeline.isRunning():
-                img = frame_queue.get()
-                dets = det_queue.get()
-                if img is None or dets is None:
+                # Blocking get on both NN passthrough and NN output — the two
+                # streams emit one message per inference, so blocking pairs
+                # them. Bboxes therefore overlay the exact frame they were
+                # computed on (no async drift, no "ghost" trailing boxes).
+                img_msg = img_queue.get()
+                nn_msg = nn_queue.get()
+                if img_msg is None or nn_msg is None:
                     continue
 
-                frame = img.getCvFrame()
+                # depthai's getCvFrame() returns a BGR-arranged numpy array
+                # for cv2 compatibility, even when the source ImgFrame is
+                # RGB888p. So no explicit cvtColor is needed — extra flip
+                # was double-swapping channels and turning skin blue/purple.
+                frame = img_msg.getCvFrame()
                 h, w = frame.shape[:2]
+
+                try:
+                    latest_dets = parse_yolov8_raw(nn_msg)
+                except Exception as e:
+                    print(f"YOLO parse error: {e}")
+                    latest_dets = []
+
+                # Depth is independent of the NN; pull non-blocking and
+                # cache the most recent map.
+                depth_msg = depth_queue.tryGet()
+                if depth_msg is not None:
+                    latest_depth_mm = depth_msg.getFrame()
                 if not shape_logged:
                     print(f"Camera frame shape: {frame.shape} (h={h}, w={w})")
                     shape_logged = True
 
-                # Refresh depth (non-blocking). Stereo runs at its own pace; cache
-                # the latest frame so bbox distance sampling still works if stereo
-                # hasn't produced a new frame this tick.
-                depth_msg = depth_queue.tryGet()
-                if depth_msg is not None:
-                    latest_depth_mm = depth_msg.getFrame()
-
                 now = time.monotonic()
 
-                # Single-class blob: every detection is a drone candidate, so
-                # we skip the COCO-label filter that oldradar.py needed.
+                # 3-class blob (airplane / drone / helicopter). When
+                # DRONE_LABEL is None we accept every class — the close-range
+                # drone view often gets labelled airplane / helicopter, so
+                # filtering strictly to label==1 was hiding real targets.
                 frame_dets = []
-                for det in dets.detections:
+                for det in latest_dets:
+                    if DRONE_LABEL is not None and det["label"] != DRONE_LABEL:
+                        continue
+                    cls_idx = int(det["label"])
+                    cls_name = (CLASS_NAMES[cls_idx]
+                                if 0 <= cls_idx < len(CLASS_NAMES)
+                                else f"cls{cls_idx}")
                     bbox = (
-                        int(det.xmin * w), int(det.ymin * h),
-                        int(det.xmax * w), int(det.ymax * h),
+                        int(det["xmin"] * w), int(det["ymin"] * h),
+                        int(det["xmax"] * w), int(det["ymax"] * h),
                     )
                     dist_m = _sample_depth_m(latest_depth_mm, bbox, w, h)
-                    frame_dets.append((bbox, "drone", float(det.confidence), dist_m))
+                    frame_dets.append((bbox, cls_name, det["confidence"], dist_m))
 
                 # Match each detection against each track's PREDICTED bbox (so a
                 # moving drone that YOLO briefly lost can still re-associate even
@@ -488,7 +653,7 @@ def main():
                     tag = "LOCK" if fresh else "HOLD"
                     dist = tr.get("dist_m", 0.0)
                     dist_txt = f" d={dist:.2f}m" if dist > 0 else ""
-                    label = f"DRONE {tag} {tr['conf']:.2f}{dist_txt}"
+                    label = f"{tr['cls'].upper()} {tag} {tr['conf']:.2f}{dist_txt}"
                     (tw, th), baseline = cv2.getTextSize(
                         label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
                     )
